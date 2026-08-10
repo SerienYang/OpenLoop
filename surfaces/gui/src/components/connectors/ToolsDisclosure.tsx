@@ -1,0 +1,53 @@
+import { updateConnectorTools, type Connector } from "../../api";
+import { GRP, ROW, TAG_QUIET, TAG_WARN } from "./ui";
+import { translateDynamic, useI18n } from "../../i18n";
+
+// Collapsed-by-default Tools group, shared by every connector detail page
+// (UX-DECISIONS §21): the lever exists everywhere but stays quiet — expanding
+// shows one row per tool with its read/write tag; writes always ask first.
+export function ToolsDisclosure({ c, onChanged }: { c: Connector; onChanged: () => void }) {
+  const { lang, t } = useI18n();
+  if (!c.tools?.length) return null;
+  const enabled = c.tools.filter((t) => t.enabled).length;
+  return (
+    <div className={GRP + " mt-6"}>
+      <details>
+        <summary className={ROW + " cursor-pointer hover:bg-paper/60 list-none [&::-webkit-details-marker]:hidden"}>
+          <span className="text-[12.5px] text-muted w-24 shrink-0">› {t("Tools")}</span>
+          <span className="min-w-0 flex-1 text-[12.5px] text-muted">
+            {t("{{enabled}} of {{total}} enabled", {
+              enabled,
+              total: c.tools.length,
+            })}
+          </span>
+        </summary>
+        {c.tools.map((tool) => (
+          <label
+            key={tool.name}
+            className={ROW + " cursor-pointer"}
+            title={`${tool.name} — ${translateDynamic(
+              tool.description,
+              lang,
+              tool.kind === "read" ? t("Read tool") : t("Write tool"),
+            )}`}
+          >
+            <input
+              type="checkbox"
+              checked={tool.enabled}
+              onChange={async (e) => {
+                await updateConnectorTools(c.name, { [tool.name]: e.target.checked });
+                onChanged();
+              }}
+            />
+            <span className="min-w-0 flex-1 text-[13px] font-medium">
+              {translateDynamic(tool.label, lang, tool.name)}
+            </span>
+            <span className={tool.kind === "write" ? TAG_WARN : TAG_QUIET}>
+              {tool.kind === "write" ? t("asks first") : t("read")}
+            </span>
+          </label>
+        ))}
+      </details>
+    </div>
+  );
+}

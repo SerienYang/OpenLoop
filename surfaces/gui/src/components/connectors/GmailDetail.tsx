@@ -1,0 +1,219 @@
+import { useState } from "react";
+import {
+  disconnectGmailAccount,
+  setGmailDefaultAccount,
+  setGmailFilters,
+  type GmailAccount,
+} from "../../api";
+import { ConnectorBadge } from "../../connectors/ConnectorIcon";
+import { AddConnectionModal } from "./AddConnectionModal";
+import { useI18n } from "../../i18n";
+import type { DetailProps } from "./ConnectorsSection";
+import { ToolsDisclosure } from "./ToolsDisclosure";
+import { FOOT, GRP, GRP_H, PILL_ACCENT, ROW, TAG_ACCENT, TAG_WARN, XBTN } from "./ui";
+
+// The Gmail detail page (UX-DECISIONS §21): connected mailboxes (multi-account,
+// Default badge, per-account disconnect) + "Never show agents" privacy filters.
+// Accounts are added with a manually supplied OAuth access token.
+
+const LABEL = "text-[12.5px] text-muted w-24 shrink-0";
+
+export function GmailDetail({ c, onChanged }: DetailProps) {
+  const { t } = useI18n();
+  const [adding, setAdding] = useState(false);
+  const accounts = (c.accounts ?? []) as GmailAccount[]; // email-keyed (pre-generic-layer shape)
+
+  return (
+    <div data-testid="gmail-detail">
+      <div className="flex items-center gap-3.5 mb-5">
+        <ConnectorBadge connector={c} size={44} title="Gmail" />
+        <div className="min-w-0 flex-1">
+          <h2 className="text-[20px] font-semibold tracking-tight leading-tight">Gmail</h2>
+          <div className="text-[12.5px] text-muted flex items-center gap-1.5">
+            {c.connected ? (
+              <>
+                <span className="w-2 h-2 rounded-full bg-ok" />
+                <span data-testid="gmail-status">
+                  {t("{{count}} accounts", { count: accounts.length })}
+                </span>
+              </>
+            ) : (
+              <span>{t("Not connected")}</span>
+            )}
+          </div>
+        </div>
+        <button
+          className={PILL_ACCENT}
+          data-testid="add-account-btn"
+          onClick={() => setAdding(true)}
+        >
+          {t("＋ Add account")}
+        </button>
+      </div>
+
+      {!c.connected && (
+        <div className={GRP}>
+          <div className={ROW + " text-[12.5px] text-muted"}>
+            {t("Paste a Gmail OAuth access token. Each mailbox stays separate.")}
+          </div>
+        </div>
+      )}
+
+      {accounts.length > 0 && (
+        <>
+          <div className={GRP_H + " !mt-0"}>{t("Accounts")}</div>
+          <div className={GRP} data-testid="gmail-accounts">
+            {accounts.map((a) => (
+              <AccountRow key={a.email} a={a} onChanged={onChanged} />
+            ))}
+          </div>
+        </>
+      )}
+
+      <FiltersGroup c={c} onChanged={onChanged} />
+
+      <ToolsDisclosure c={c} onChanged={onChanged} />
+      <div className={FOOT + " mt-2"}>
+        {t("Filters are enforced on this computer, before an agent sees results. Hidden counts show on the tool card and in Activity — never the content.")}
+      </div>
+      {adding && (
+        <AddConnectionModal
+          c={c}
+          title={t("Add an account")}
+          onClose={() => setAdding(false)}
+          onChanged={onChanged}
+        />
+      )}
+    </div>
+  );
+}
+
+function AccountRow({ a, onChanged }: { a: GmailAccount; onChanged: () => void }) {
+  const { t } = useI18n();
+  const [busy, setBusy] = useState(false);
+  return (
+    <div className={ROW} data-testid={`gmail-account-${a.email}`}>
+      <span className="min-w-0 flex-1 flex items-center gap-2">
+        <span className="text-[13px] font-medium truncate">{a.email}</span>
+        {a.default && <span className={TAG_ACCENT}>{t("Default")}</span>}
+        {a.needs_reauth && <span className={TAG_WARN}>⚠ {t("Sign in again")}</span>}
+      </span>
+      {!a.default && (
+        <button
+          className="text-[12px] text-muted hover:text-ink shrink-0"
+          data-testid={`gmail-make-default-${a.email}`}
+          onClick={async () => {
+            await setGmailDefaultAccount(a.email);
+            onChanged();
+          }}
+        >
+          {t("Make default")}
+        </button>
+      )}
+      <button
+        className={XBTN}
+        title={t("Disconnect this mailbox")}
+        data-testid={`gmail-disconnect-${a.email}`}
+        disabled={busy}
+        onClick={async () => {
+          setBusy(true);
+          await disconnectGmailAccount(a.email);
+          setBusy(false);
+          onChanged();
+        }}
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+
+function FiltersGroup({ c, onChanged }: Pick<DetailProps, "c" | "onChanged">) {
+  const { t } = useI18n();
+  const filters = c.filters ?? { senders: [], labels: [] };
+  return (
+    <>
+      <div className={GRP_H}>{t("Never show agents")}</div>
+      <div className={GRP} data-testid="gmail-filters">
+        <ChipListRow
+          label={t("Senders")}
+          testid="gmail-filter-senders"
+          placeholder={t("name@example.com or @domain.com")}
+          values={filters.senders}
+          onSave={async (senders) => {
+            await setGmailFilters({ senders });
+            onChanged();
+          }}
+        />
+        <ChipListRow
+          label={t("Labels")}
+          testid="gmail-filter-labels"
+          placeholder={t("Label name, e.g. Personal")}
+          values={filters.labels}
+          onSave={async (labels) => {
+            await setGmailFilters({ labels });
+            onChanged();
+          }}
+        />
+      </div>
+      <div className={FOOT}>
+        {t("Matching email is silently left out of what agents read — no trace they could probe.")}
+      </div>
+    </>
+  );
+}
+
+function ChipListRow({
+  label,
+  testid,
+  placeholder,
+  values,
+  onSave,
+}: {
+  label: string;
+  testid: string;
+  placeholder: string;
+  values: string[];
+  onSave: (next: string[]) => Promise<void>;
+}) {
+  const { t } = useI18n();
+  const [draft, setDraft] = useState("");
+  const add = async () => {
+    const v = draft.trim();
+    if (!v) return;
+    setDraft("");
+    await onSave([...values, v]);
+  };
+  return (
+    <div className={ROW} data-testid={testid}>
+      <span className={LABEL}>{label}</span>
+      <span className="min-w-0 flex-1 flex flex-wrap items-center gap-1.5">
+        {values.map((v) => (
+          <span
+            key={v}
+            className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-paper border border-line text-[12.5px]"
+          >
+            {v}
+            <button
+              className={XBTN}
+              title={t("remove")}
+              onClick={() => onSave(values.filter((x) => x !== v))}
+            >
+              ×
+            </button>
+          </span>
+        ))}
+        <input
+          className="flex-1 min-w-[140px] bg-transparent text-[12.5px] outline-none placeholder:text-faint"
+          placeholder={placeholder}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") add();
+          }}
+          onBlur={() => draft.trim() && add()}
+        />
+      </span>
+    </div>
+  );
+}

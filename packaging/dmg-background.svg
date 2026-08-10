@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="800" viewBox="0 0 640 400">
+  <rect width="640" height="400" fill="#f3f4f6"/>
+  <text
+    x="320"
+    y="70"
+    fill="#181b20"
+    font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
+    font-size="23"
+    font-weight="600"
+    text-anchor="middle"
+  >Install OpenLoop</text>
+  <text
+    x="320"
+    y="97"
+    fill="#7a8089"
+    font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
+    font-size="13"
+    text-anchor="middle"
+  >Drag the app into the Applications folder</text>
+  <path d="M264 190 H376" fill="none" stroke="#353a42" stroke-width="2"/>
+  <path d="M376 190 L364 183 V197 Z" fill="#353a42"/>
+</svg>

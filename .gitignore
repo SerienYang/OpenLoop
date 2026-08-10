@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.coverage
+.superpowers/
+.vscode/
+AGENTS.md
+PROJECT_SUMMARY.md
+docs/superpowers/
+
+# Local secrets (live-smoke BYO keys) — never committed
+.env
