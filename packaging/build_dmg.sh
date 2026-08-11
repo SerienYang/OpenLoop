@@ -160,6 +160,9 @@ if [ -n "${TAURI_SIGNING_PRIVATE_KEY_PATH:-}" ]; then
     echo "ERROR: updater private key path must not be a symlink" >&2
     exit 1
   }
+  # Tauri's build/bundle path accepts a file path through the standard variable.
+  # Keep the loader-specific path variable separate until after local validation.
+  export TAURI_SIGNING_PRIVATE_KEY="$TAURI_SIGNING_PRIVATE_KEY_PATH"
 fi
 UPDATER_KEY_AVAILABLE=0
 if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] || [ -n "${TAURI_SIGNING_PRIVATE_KEY_PATH:-}" ]; then

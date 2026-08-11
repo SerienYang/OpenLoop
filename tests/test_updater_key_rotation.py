@@ -196,6 +196,10 @@ def test_workflow_and_build_script_use_single_bundle_path_contract() -> None:
     assert "secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" not in workflow
     assert "TAURI_SIGNING_PRIVATE_KEY_PATH" in build_script
     assert "UPDATER_KEY_AVAILABLE" in build_script
+    assert (
+        'export TAURI_SIGNING_PRIVATE_KEY="$TAURI_SIGNING_PRIVATE_KEY_PATH"'
+        in build_script
+    )
 
 
 def test_rotation_helper_decodes_public_key_and_builds_bundle() -> None:
