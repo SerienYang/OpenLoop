@@ -7,8 +7,8 @@
 #   - tag push `v*`  → builds the DMG and publishes a GitHub Release.
 #   - manual run     → builds and uploads workflow artifacts only (no release).
 #
-# The installer is uploaded twice: once with its versioned name (archive) and once with the
-# stable name OpenLoop-macos-arm64.dmg so README and websites can link to
+# The installer is published with the stable name OpenLoop-macos-arm64.dmg so README and
+# websites can link to
 #   github.com/<repo>/releases/latest/download/<stable-name>
 # and never need updating.
 #
@@ -104,11 +104,10 @@ jobs:
           unset APPLE_API_KEY_CONTENT
           bash packaging/build_dmg.sh
 
-      - name: Stage artifacts (versioned + stable names)
+      - name: Stage artifacts
         run: |
           mkdir -p out
           BUNDLE=surfaces/gui/src-tauri/target/release/bundle
-          cp "$BUNDLE"/dmg/*.dmg out/
           cp "$BUNDLE"/dmg/*.dmg out/OpenLoop-${{ matrix.slug }}.dmg
           # macOS updater artifact: the signed .app tarball the installed app swaps in.
           if [ -f "$BUNDLE"/macos/OpenLoop.app.tar.gz ]; then
