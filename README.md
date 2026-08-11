@@ -8,9 +8,9 @@
 
 <sub>macOS 12+ · Apple Silicon · Windows is on the way / Windows 版本正在路上</sub>
 
-> Preview builds are currently unsigned. On first launch, right-click OpenLoop and choose **Open**.
+> Preview builds are currently unsigned. On the first manual installation, right-click OpenLoop and choose **Open**, or run `xattr -cr /Applications/OpenLoop.app` in Terminal. Version `0.1.12` is a one-time manual transition to the new updater trust key. After it is installed and trusted, later releases can normally be downloaded, verified, and installed inside OpenLoop without repeating the Terminal command.
 >
-> 当前预览版尚未正式签名，因此启动时可能提示未签名或者安装包损坏，解决方案有两种：首次启动时，请右键点击 OpenLoop来打开,或者，打开**终端**运行指令（xattr -cr /Applications/OpenLoop.app）后打开；
+> 当前预览版尚未正式签名。首次手动安装时，请右键点击 OpenLoop 并选择**打开**，或在终端运行 `xattr -cr /Applications/OpenLoop.app`。`0.1.12` 是切换到新 updater 信任密钥的一次性手动过渡版；安装并信任该版本后，后续版本通常可以直接在 OpenLoop 内下载、验签并安装，无需重复执行终端命令。
 >
 <img width="1236" height="618" alt="image" src="https://github.com/user-attachments/assets/28910826-c734-4ee8-a231-f2a7a6426b1d" />
 
