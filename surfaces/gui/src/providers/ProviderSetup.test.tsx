@@ -2,10 +2,11 @@
 // only the selected method's fields render, and clicking a segment switches them.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { ProviderForm, type ProviderSetupState } from "./ProviderSetup";
+import { KEY_HELP, ProviderForm, type ProviderSetupState } from "./ProviderSetup";
 import type { ProviderInfo } from "../api";
 
 vi.mock("../tauri", () => ({ openExternal: vi.fn() }));
+import { openExternal } from "../tauri";
 
 afterEach(cleanup);
 
@@ -39,16 +40,34 @@ const BEDROCK: ProviderInfo = {
   ],
 };
 
-function makePs(fields: Record<string, string>, setFieldValue = vi.fn()): ProviderSetupState {
+const VOLCENGINE: ProviderInfo = {
+  name: "volcengine",
+  title: "Volcengine Ark (Agent Plan)",
+  needs_key: true,
+  configured: false,
+  values: {},
+  suggested_models: [],
+  recommended_model: "ark-code-latest",
+  fields: [
+    { key: "api_key", label: "Volcengine API key", secret: true, required: true, help: "", placeholder: "" },
+    { key: "base_url", label: "Endpoint", secret: false, required: false, help: "", placeholder: "" },
+  ],
+};
+
+function makePs(
+  fields: Record<string, string>,
+  setFieldValue = vi.fn(),
+  provider = BEDROCK,
+): ProviderSetupState {
   return {
-    providers: [BEDROCK],
-    ordered: [BEDROCK],
+    providers: [provider],
+    ordered: [provider],
     providerOrder: null,
     swapProviders: () => {},
     clearProviderOrderNotice: () => {},
     refreshProviders: async () => {},
-    sel: "bedrock",
-    info: BEDROCK,
+    sel: provider.name,
+    info: provider,
     fields,
     setFieldValue,
     dirty: false,
@@ -95,5 +114,23 @@ describe("ProviderForm auth-method choice", () => {
     render(<ProviderForm ps={makePs({ auth_method: "iam" })} tp="t" />);
     expect(screen.getByTestId("t-field-aws_secret_access_key")).toBeTruthy();
     expect(screen.queryByTestId("t-field-bedrock_api_key")).toBeNull();
+  });
+});
+
+describe("provider key help", () => {
+  it("opens Volcengine's dedicated Agent Plan key page", () => {
+    const url =
+      "https://console.volcengine.com/ark/region:ark+cn-beijing/openManagement?LLM=%7B%7D&advancedActiveKey=agentEnterprise";
+    expect(KEY_HELP.volcengine.url).toBe(url);
+
+    render(
+      <ProviderForm
+        ps={makePs({ api_key: "", base_url: "" }, vi.fn(), VOLCENGINE)}
+        tp="t"
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Create one at/ }));
+
+    expect(openExternal).toHaveBeenCalledWith(url);
   });
 });

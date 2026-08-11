@@ -139,6 +139,39 @@ describe("i18n translate", () => {
     ).toBe("Backend copy added after this release");
   });
 
+  it("translates Volcengine Agent Plan authorization failures", () => {
+    expect(
+      translate(
+        "Volcengine rejected the API key. Use the dedicated Agent Plan API key.",
+        "zh-CN",
+      ),
+    ).toBe("火山引擎拒绝了该密钥。请使用 Agent Plan 专属 API Key。");
+    expect(
+      translate(
+        "Volcengine rejected the account status. Contact the platform administrator.",
+        "zh-CN",
+      ),
+    ).toBe("火山引擎拒绝了当前账号状态。请联系平台管理员。");
+    expect(
+      translate(
+        "Volcengine Agent Plan subscription is inactive or expired.",
+        "zh-CN",
+      ),
+    ).toBe("火山引擎 Agent Plan 套餐未生效或已过期。");
+    expect(
+      translate(
+        "Volcengine denied the request. Check Agent Plan access, account balance, and resource permissions.",
+        "zh-CN",
+      ),
+    ).toBe("火山引擎拒绝了请求。请检查 Agent Plan 权限、账户余额和资源权限。");
+    expect(
+      translate(
+        "Volcengine could not access the requested model or endpoint. Check model availability and the Endpoint setting.",
+        "zh-CN",
+      ),
+    ).toBe("火山引擎无法访问请求的模型或端点。请检查模型可用性和 Endpoint 设置。");
+  });
+
   it("interpolates {{vars}} in the translated value", () => {
     expect(
       translate("approved · {{mode}}", "zh-CN", { mode: "manual" }),

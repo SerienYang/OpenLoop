@@ -923,14 +923,54 @@ def verify_provider_key(
 
     if resp.status_code < 300:
         return {"ok": True}
+    if name == "volcengine":
+        error_code = ""
+        try:
+            error = resp.json().get("error", {})
+            if isinstance(error, dict):
+                error_code = str(error.get("code") or "")
+        except (AttributeError, TypeError, ValueError):
+            pass
+        if error_code == "AuthenticationError":
+            return {
+                "ok": False,
+                "error": "Volcengine rejected the API key. Use the dedicated "
+                "Agent Plan API key.",
+            }
+        if error_code == "InvalidAccountStatus":
+            return {
+                "ok": False,
+                "error": "Volcengine rejected the account status. Contact the "
+                "platform administrator.",
+            }
+        if error_code == "InvalidSubscription":
+            return {
+                "ok": False,
+                "error": "Volcengine Agent Plan subscription is inactive or expired.",
+            }
+        if resp.status_code == 401:
+            return {
+                "ok": False,
+                "error": "Volcengine rejected authentication. Check the Agent Plan "
+                "credentials and account status.",
+            }
+        if resp.status_code == 403:
+            return {
+                "ok": False,
+                "error": "Volcengine denied the request. Check Agent Plan access, "
+                "account balance, and resource permissions.",
+            }
+        if resp.status_code == 404:
+            return {
+                "ok": False,
+                "error": "Volcengine could not access the requested model or endpoint. "
+                "Check model availability and the Endpoint setting.",
+            }
+        return {"ok": False, "error": f"{d.title} returned HTTP {resp.status_code}."}
     if resp.status_code in (401, 403):
         if name == "ollama":
             return {"ok": False, "error": "Server rejected the request."}
         return {"ok": False, "error": "Invalid API key."}
-    if name == "volcengine":
-        # 400 (probe model rejected) / 404 / 429 etc. all mean the key passed
-        # auth; only 401/403 mean the key itself is bad.
-        return {"ok": True, "note": f"Key accepted (HTTP {resp.status_code})."}
     if resp.status_code == 404 and name == "ollama":
         return {
             "ok": False,

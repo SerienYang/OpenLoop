@@ -1,5 +1,7 @@
-"""Tests for provider key detection + the live (read-only) Test/verify path. SDK-free: the
-single httpx.get is monkeypatched so no network is touched."""
+"""Tests for provider key detection + the live (read-only) Test/verify path.
+
+SDK-free: httpx calls are monkeypatched so no network is touched.
+"""
 
 from __future__ import annotations
 
@@ -39,6 +41,18 @@ def _patch_get(monkeypatch, status=200, capture=None, raise_exc=None):
         return SimpleNamespace(status_code=status)
 
     monkeypatch.setattr("httpx.get", fake_get)
+
+
+def _patch_post(monkeypatch, status=200, capture=None, raise_exc=None, payload=None):
+    def fake_post(url, **kwargs):
+        if capture is not None:
+            capture["url"] = url
+            capture.update(kwargs)
+        if raise_exc is not None:
+            raise raise_exc
+        return SimpleNamespace(status_code=status, json=lambda: payload or {})
+
+    monkeypatch.setattr("httpx.post", fake_post)
 
 
 def test_verify_openai_ok(monkeypatch):
@@ -106,6 +120,86 @@ def test_verify_opencode_go_rejects_invalid_key(monkeypatch, status):
         "ok": False,
         "error": "Invalid API key.",
     }
+
+
+def test_verify_volcengine_uses_agent_plan_chat_probe(monkeypatch):
+    cap: dict = {}
+    _patch_post(monkeypatch, status=200, capture=cap)
+
+    assert verify_provider_key(
+        "volcengine",
+        api_key="ark-plan-key",
+        base_url="https://ark.cn-beijing.volces.com/api/plan/v3/",
+    ) == {"ok": True}
+    assert (
+        cap["url"]
+        == "https://ark.cn-beijing.volces.com/api/plan/v3/chat/completions"
+    )
+    assert cap["headers"]["Authorization"] == "Bearer ark-plan-key"
+    assert cap["headers"]["Content-Type"] == "application/json"
+    assert cap["json"]["model"] == "ark-code-latest"
+    assert cap["json"]["messages"] == [{"role": "user", "content": "ping"}]
+    assert cap["json"]["max_tokens"] == 1
+    assert cap["timeout"] == 10.0
+
+
+@pytest.mark.parametrize(
+    ("status", "payload", "error"),
+    [
+        (
+            401,
+            {"error": {"code": "AuthenticationError"}},
+            "Volcengine rejected the API key. Use the dedicated Agent Plan API key.",
+        ),
+        (
+            401,
+            {"error": {"code": "InvalidAccountStatus"}},
+            "Volcengine rejected the account status. Contact the platform administrator.",
+        ),
+        (
+            400,
+            {"error": {"code": "InvalidSubscription"}},
+            "Volcengine Agent Plan subscription is inactive or expired.",
+        ),
+        (
+            403,
+            {"error": {"code": "AccountOverdueError"}},
+            "Volcengine denied the request. Check Agent Plan access, account balance, and resource permissions.",
+        ),
+        (
+            404,
+            {"error": {"code": "ModelNotOpen"}},
+            "Volcengine could not access the requested model or endpoint. Check model availability and the Endpoint setting.",
+        ),
+    ],
+)
+def test_verify_volcengine_reports_actionable_failures(
+    monkeypatch, status, payload, error
+):
+    _patch_post(monkeypatch, status=status, payload=payload)
+
+    assert verify_provider_key(
+        "volcengine",
+        api_key="ark-plan-key",
+        base_url="https://ark.cn-beijing.volces.com/api/plan/v3",
+    ) == {"ok": False, "error": error}
+
+
+def test_verify_volcengine_reports_unexpected_status(monkeypatch):
+    _patch_post(monkeypatch, status=500, payload={"error": {"code": "InternalError"}})
+
+    assert verify_provider_key("volcengine", api_key="ark-plan-key") == {
+        "ok": False,
+        "error": "Volcengine Ark (Agent Plan) returned HTTP 500.",
+    }
+
+
+def test_verify_volcengine_reports_network_error(monkeypatch):
+    _patch_post(monkeypatch, raise_exc=ConnectionError("boom"))
+
+    res = verify_provider_key("volcengine", api_key="ark-plan-key")
+    assert res["ok"] is False
+    assert res["error"] == "Couldn't reach Volcengine Ark (Agent Plan) (ConnectionError)."
 
 
 def test_verify_network_error_is_clean(monkeypatch):

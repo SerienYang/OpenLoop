@@ -1426,6 +1426,11 @@ export const zhCN: Record<string, string> = {
   "Use the value provided by the model service.": "请填写模型服务提供的值。",
   "Use the value provided by {{title}}.": "请填写 {{title}} 提供的值。",
   "Use this authentication method to connect.": "使用此认证方式连接。",
+  "Volcengine Agent Plan subscription is inactive or expired.": "火山引擎 Agent Plan 套餐未生效或已过期。",
+  "Volcengine could not access the requested model or endpoint. Check model availability and the Endpoint setting.": "火山引擎无法访问请求的模型或端点。请检查模型可用性和 Endpoint 设置。",
+  "Volcengine denied the request. Check Agent Plan access, account balance, and resource permissions.": "火山引擎拒绝了请求。请检查 Agent Plan 权限、账户余额和资源权限。",
+  "Volcengine rejected the account status. Contact the platform administrator.": "火山引擎拒绝了当前账号状态。请联系平台管理员。",
+  "Volcengine rejected the API key. Use the dedicated Agent Plan API key.": "火山引擎拒绝了该密钥。请使用 Agent Plan 专属 API Key。",
   "Write operations ask for approval before they run.": "写操作执行前会请求批准。",
   "Write tool": "写入工具",
 };
