@@ -10,9 +10,7 @@
 
 > Preview builds are currently unsigned. On first launch, right-click OpenLoop and choose **Open**.
 >
-> 当前预览版尚未正式签名，因此启动时可能提示未签名或者安装包损坏，解决方案有两种：
-> 1.首次启动时，请右键点击 OpenLoop来打开；
-> 2.或者，打开**终端**运行指令（xattr -cr /Applications/OpenLoop.app）后打开；
+> 当前预览版尚未正式签名，因此启动时可能提示未签名或者安装包损坏，解决方案有两种：首次启动时，请右键点击 OpenLoop来打开,或者，打开**终端**运行指令（xattr -cr /Applications/OpenLoop.app）后打开；
 >
 <img width="1236" height="618" alt="image" src="https://github.com/user-attachments/assets/28910826-c734-4ee8-a231-f2a7a6426b1d" />
 
