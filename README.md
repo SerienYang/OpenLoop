@@ -11,6 +11,9 @@
 > Preview builds are currently unsigned. On first launch, right-click OpenLoop and choose **Open**.
 >
 > 当前预览版尚未正式签名。首次启动时，请右键点击 OpenLoop 并选择**打开**。
+>
+<img width="1236" height="618" alt="image" src="https://github.com/user-attachments/assets/28910826-c734-4ee8-a231-f2a7a6426b1d" />
+
 
 OpenLoop is a local-first, open-source client for general-purpose task agents. It is not another chat window. It is a desktop runtime that can understand your projects, operate real tools, connect to external services, and carry work forward.
 
