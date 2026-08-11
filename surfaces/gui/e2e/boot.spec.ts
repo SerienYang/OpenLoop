@@ -42,3 +42,31 @@ test("model picker recovers when settings fetches die during sidecar boot", asyn
   });
   await expect(page.getByTestId("models-loading")).toHaveCount(0);
 });
+
+test("boot ignores archived sessions when choosing what to resume", async ({ page }) => {
+  await page.route("**/v1/sessions", (route) =>
+    route.fulfill({
+      json: {
+        sessions: [
+          {
+            session_id: "archived-latest",
+            title: "Archived conversation",
+            workspace: "",
+            agent: "openloop",
+            model: "anthropic:claude-opus-4-8",
+            mode: "interactive",
+            updated_at: "2026-08-11 12:00:00",
+            messages: 2,
+            pinned: false,
+            archived: true,
+          },
+        ],
+      },
+    }),
+  );
+
+  await page.goto("/");
+
+  await expect(page.locator(".main-title-text")).toHaveText("New session");
+  await expect(page.locator(".main-title-text")).not.toHaveText("Archived conversation");
+});

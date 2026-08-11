@@ -350,7 +350,9 @@ export function App() {
   const resumeLast = async () => {
     let loadedSessions: SessionInfo[] = [];
     try {
-      loadedSessions = (await getSessions()).filter((s) => s.session_id && !s.session_id.startsWith("__"));
+      loadedSessions = (await getSessions()).filter(
+        (s) => s.session_id && !s.session_id.startsWith("__") && !s.archived,
+      );
       setSessions(loadedSessions);
       const sess = loadedSessions;
       const ts = (s: SessionInfo) => Date.parse(s.updated_at || "") || Number(s.updated_at) || 0;
