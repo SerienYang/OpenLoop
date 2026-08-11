@@ -5,7 +5,7 @@
 //!      sidecar on that port (so it never clashes with a hand-run server on 8765);
 //!   2. injects the sidecar HTTP/WS addresses and per-launch authentication token before the
 //!      SPA loads (single codebase — the browser build still hits 8765);
-//!   3. lives in the system tray: closing the window hides it (keeps MyHelper + the scheduler
+//!   3. lives in the system tray: closing the window hides it (keeps OpenLoop + the scheduler
 //!      running); only tray → Quit stops the sidecar;
 //!   4. exposes native commands: folder picker, autostart (open-at-login), and keep-awake
 //!      (caffeinate, so scheduled tasks fire while the Mac is idle).
@@ -13,6 +13,8 @@
 //! The sidecar inherits this process's environment, so a shell-launched `npm run tauri dev`
 //! passes `OPENAI_API_KEY` through. A Finder-launched app has no shell env — there the key
 //! comes from the SecretStore (Settings tab), see the Python provider resolver.
+
+mod updater;
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -28,6 +30,10 @@ use tauri::{
     Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt;
+use updater::{
+    check_for_update, clear_pending_update, download_update, get_app_version, install_update,
+    UpdateManager,
+};
 use uuid::Uuid;
 
 /// The sidecar server child — killed on exit (orphaned servers have bitten us before).
@@ -112,12 +118,7 @@ fn server_bin() -> PathBuf {
             for exe_name in exe_names {
                 candidates.push(dir.join("sidecar").join(exe_name));
                 if let Some(contents) = dir.parent() {
-                    candidates.push(
-                        contents
-                            .join("Resources")
-                            .join("sidecar")
-                            .join(exe_name),
-                    );
+                    candidates.push(contents.join("Resources").join("sidecar").join(exe_name));
                 }
                 candidates.push(dir.join(exe_name));
             }
@@ -230,13 +231,16 @@ fn write_awake_rule_pref(rule: AwakeRule) {
         serde_json::Value::String(rule.as_str().into()),
     );
     // Keep the legacy key in sync so older builds still interpret the strongest rule.
-    prefs.insert("keep_awake".into(), serde_json::Value::Bool(rule == AwakeRule::Always));
+    prefs.insert(
+        "keep_awake".into(),
+        serde_json::Value::Bool(rule == AwakeRule::Always),
+    );
     write_desktop_prefs(prefs);
 }
 
 fn reconcile_awake(state: &mut AwakeState) {
-    let should_hold = state.rule == AwakeRule::Always
-        || (state.rule == AwakeRule::WhileRunning && state.running);
+    let should_hold =
+        state.rule == AwakeRule::Always || (state.rule == AwakeRule::WhileRunning && state.running);
     if should_hold {
         if state.guard.is_none() {
             state.guard = start_keep_awake();
@@ -337,7 +341,11 @@ async fn pick_folder(app: tauri::AppHandle, default_dir: Option<String>) -> Opti
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = std::sync::mpsc::channel();
     let mut builder = app.dialog().file();
-    if let Some(dir) = default_dir.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+    if let Some(dir) = default_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
         if std::path::Path::new(dir).is_dir() {
             builder = builder.set_directory(dir);
         }
@@ -368,7 +376,11 @@ fn get_keep_awake(state: tauri::State<KeepAwake>) -> bool {
 #[tauri::command]
 fn set_keep_awake(state: tauri::State<KeepAwake>, enabled: bool) -> bool {
     let mut awake = state.0.lock().unwrap();
-    awake.rule = if enabled { AwakeRule::Always } else { AwakeRule::Off };
+    awake.rule = if enabled {
+        AwakeRule::Always
+    } else {
+        AwakeRule::Off
+    };
     reconcile_awake(&mut awake);
     write_awake_rule_pref(awake.rule);
     awake.rule == AwakeRule::Always
@@ -629,101 +641,6 @@ fn should_show_main_on_reopen(has_visible_windows: bool) -> bool {
     !has_visible_windows
 }
 
-// --- Auto-update (tauri-plugin-updater) -------------------------------------------
-// The GUI drives updates through these commands (same invoke bridge as everything
-// else — no global plugin JS): check, background pre-download, install. Update
-// artifacts are minisign-verified against the pubkey in tauri.conf.json before
-// anything is installed; the manifest lives at the endpoints configured there
-// (GitHub Releases).
-
-#[derive(serde::Serialize)]
-struct UpdateInfo {
-    version: String,
-    notes: String,
-}
-
-#[tauri::command]
-async fn check_for_update(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, String> {
-    use tauri_plugin_updater::UpdaterExt;
-    let updater = app.updater().map_err(|e| e.to_string())?;
-    let update = updater.check().await.map_err(|e| e.to_string())?;
-    Ok(update.map(|u| UpdateInfo {
-        version: u.version.clone(),
-        notes: u.body.clone().unwrap_or_default(),
-    }))
-}
-
-/// Update bytes pre-fetched by `download_update`, keyed by version. The GUI kicks the
-/// download off as soon as a release is offered, so clicking "Restart to update" installs
-/// from memory instead of sitting on a multi-minute download behind a spinner.
-struct PendingUpdate(Mutex<Option<(String, Vec<u8>)>>);
-
-#[tauri::command]
-async fn download_update(
-    app: tauri::AppHandle,
-    pending: tauri::State<'_, PendingUpdate>,
-) -> Result<(), String> {
-    use tauri_plugin_updater::UpdaterExt;
-    let updater = app.updater().map_err(|e| e.to_string())?;
-    let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
-        return Err("no update available".into());
-    };
-    // Periodic re-checks re-invoke this for the same release — the cached bytes stand.
-    // (Guard scope stays sync: a std MutexGuard must not live across an await.)
-    {
-        let slot = pending.0.lock().unwrap();
-        if slot.as_ref().map(|(v, _)| v == &update.version).unwrap_or(false) {
-            return Ok(());
-        }
-    }
-    let bytes = update
-        .download(|_, _| {}, || {})
-        .await
-        .map_err(|e| e.to_string())?;
-    *pending.0.lock().unwrap() = Some((update.version.clone(), bytes));
-    Ok(())
-}
-
-/// Drop the pre-fetched bundle. Invoked on "Later": a dismissed release would
-/// otherwise pin tens of MB in memory for the rest of an app run that can last
-/// weeks. Changing one's mind just re-downloads.
-#[tauri::command]
-fn clear_pending_update(pending: tauri::State<'_, PendingUpdate>) {
-    *pending.0.lock().unwrap() = None;
-}
-
-#[tauri::command]
-async fn install_update(
-    app: tauri::AppHandle,
-    pending: tauri::State<'_, PendingUpdate>,
-) -> Result<(), String> {
-    use tauri_plugin_updater::UpdaterExt;
-    let updater = app.updater().map_err(|e| e.to_string())?;
-    let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
-        return Err("no update available".into());
-    };
-    // Pre-fetched bytes for this exact version install instantly; a stale or missing
-    // cache falls back to the original blocking download-and-install.
-    let cached = {
-        let mut slot = pending.0.lock().unwrap();
-        match slot.take() {
-            Some((v, bytes)) if v == update.version => Some(bytes),
-            _ => None,
-        }
-    };
-    match cached {
-        Some(bytes) => update.install(bytes).map_err(|e| e.to_string())?,
-        None => update
-            .download_and_install(|_, _| {}, || {})
-            .await
-            .map_err(|e| e.to_string())?,
-    }
-    // Windows never reaches here (the NSIS installer takes over and relaunches).
-    // macOS: the .app was swapped in place — restart into the new version. The tray
-    // Exit path's sidecar kill runs via RunEvent, so no orphaned sidecar process.
-    app.restart();
-}
-
 fn initialization_script(http: &str, ws: &str, api_token: &str, platform: &str) -> String {
     format!(
         "window.__OPENLOOP_HTTP__={http:?};window.__OPENLOOP_WS__={ws:?};window.__OPENLOOP_API_TOKEN__={api_token:?};window.__OPENLOOP_PLATFORM__={platform:?};"
@@ -782,6 +699,7 @@ pub fn run() {
             mark_dictation_test_passed,
             delete_dictation_model,
             dictation_level,
+            get_app_version,
             check_for_update,
             download_update,
             clear_pending_update,
@@ -847,7 +765,7 @@ pub fn run() {
             };
             reconcile_awake(&mut awake);
             app.manage(KeepAwake(Mutex::new(awake)));
-            app.manage(PendingUpdate(Mutex::new(None)));
+            app.manage(UpdateManager::default());
             // Voice recordings are transient; only the explicitly installed local Whisper model
             // lives in the existing application state directory.
             app.manage(Arc::new(Dictation::new(state_dir().join("models"))));
@@ -1051,10 +969,7 @@ mod tests {
 
     #[test]
     fn tray_menu_labels_follow_the_interface_language() {
-        assert_eq!(
-            tray_menu_labels("zh-CN"),
-            ("打开 OpenLoop", "设置", "退出")
-        );
+        assert_eq!(tray_menu_labels("zh-CN"), ("打开 OpenLoop", "设置", "退出"));
         assert_eq!(
             tray_menu_labels("en"),
             ("Open OpenLoop", "Settings", "Quit")

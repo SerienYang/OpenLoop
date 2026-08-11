@@ -5,6 +5,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+packaging/updater-verifier/target/
 .coverage
 .superpowers/
 .vscode/

@@ -2687,7 +2687,10 @@ dependencies = [
 name = "openloop-desktop"
 version = "0.1.11"
 dependencies = [
+ "async-trait",
+ "minisign-verify",
  "openloop-stt",
+ "semver",
  "serde",
  "serde_json",
  "tauri",
@@ -2697,6 +2700,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
+ "tempfile",
  "uuid",
 ]
 

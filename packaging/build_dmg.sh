@@ -42,6 +42,8 @@ VERSION="$(node -p "require('$GUI/src-tauri/tauri.conf.json').version")"
 TRIPLE="$(rustc -vV | sed -n 's/host: //p')"   # e.g. aarch64-apple-darwin
 ARCH="${TRIPLE%%-*}"
 BUNDLE_APP="$GUI/src-tauri/target/release/bundle/macos/$APP.app"
+UPDATER_ARCHIVE="$GUI/src-tauri/target/release/bundle/macos/$APP.app.tar.gz"
+UPDATER_SIGNATURE="$UPDATER_ARCHIVE.sig"
 BUILD_START="$(date +%s)"
 
 # CI keychain bootstrap: on a fresh runner the Developer ID cert exists only as the
@@ -135,12 +137,36 @@ echo "==> [3/5] tauri build (.app)"
 # Keyless builds skip the overlay entirely so dev/fork builds keep working; keyless
 # RELEASES would strand every install without auto-update, hence the loud warning.
 UPDATER_ENV="${OPENLOOP_UPDATER_ENV:-$PLATFORM/../.openloop-updater.env}"
-if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ] && [ -f "$UPDATER_ENV" ]; then
+if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] && [ -n "${TAURI_SIGNING_PRIVATE_KEY_PATH:-}" ]; then
+  echo "ERROR: set only one of TAURI_SIGNING_PRIVATE_KEY or TAURI_SIGNING_PRIVATE_KEY_PATH" >&2
+  exit 1
+fi
+if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ] \
+  && [ -z "${TAURI_SIGNING_PRIVATE_KEY_PATH:-}" ] \
+  && [ -f "$UPDATER_ENV" ]; then
   # shellcheck disable=SC1090
   source "$UPDATER_ENV"
 fi
+if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] && [ -n "${TAURI_SIGNING_PRIVATE_KEY_PATH:-}" ]; then
+  echo "ERROR: updater env configured both key content and key path" >&2
+  exit 1
+fi
+if [ -n "${TAURI_SIGNING_PRIVATE_KEY_PATH:-}" ]; then
+  [ -f "$TAURI_SIGNING_PRIVATE_KEY_PATH" ] || {
+    echo "ERROR: updater private key path is not a regular file" >&2
+    exit 1
+  }
+  [ ! -L "$TAURI_SIGNING_PRIVATE_KEY_PATH" ] || {
+    echo "ERROR: updater private key path must not be a symlink" >&2
+    exit 1
+  }
+fi
+UPDATER_KEY_AVAILABLE=0
+if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] || [ -n "${TAURI_SIGNING_PRIVATE_KEY_PATH:-}" ]; then
+  UPDATER_KEY_AVAILABLE=1
+fi
 UPDATER_OVERLAY=()
-if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+if [ "$UPDATER_KEY_AVAILABLE" -eq 1 ]; then
   UPDATER_OVERLAY=(--config '{"bundle":{"createUpdaterArtifacts":true}}')
 else
   echo "    WARNING: no updater signing key — building WITHOUT auto-update artifacts (not releasable)."
@@ -150,6 +176,7 @@ fi
 # mode reads like "the new build is still opening localhost:1420" because the packaged app is an
 # older dev shell, not the current release build.
 rm -rf "$BUNDLE_APP"
+rm -f "$UPDATER_ARCHIVE" "$UPDATER_SIGNATURE"
 # ${arr[@]+…} guard: plain "${arr[@]}" on an EMPTY array is an "unbound variable"
 # under set -u on macOS's stock bash 3.2 — hit by keyless (fresh-clone) builds.
 ( cd "$GUI" && npm run tauri build -- --bundles app ${UPDATER_OVERLAY[@]+"${UPDATER_OVERLAY[@]}"} )
@@ -163,6 +190,15 @@ APP_BIN_MTIME="$(stat -f %m "$APP_BIN" 2>/dev/null || stat -c %Y "$APP_BIN")"
 if [ "${APP_BIN_MTIME:-0}" -lt "$BUILD_START" ]; then
   echo "ERROR: bundle executable is older than this build start; refusing to package stale app output." >&2
   exit 1
+fi
+if [ "$UPDATER_KEY_AVAILABLE" -eq 1 ]; then
+  [ -f "$UPDATER_ARCHIVE" ] || { echo "ERROR: missing updater archive: $UPDATER_ARCHIVE" >&2; exit 1; }
+  [ -f "$UPDATER_SIGNATURE" ] || { echo "ERROR: missing updater signature: $UPDATER_SIGNATURE" >&2; exit 1; }
+  UPDATER_MTIME="$(stat -f %m "$UPDATER_ARCHIVE" 2>/dev/null || stat -c %Y "$UPDATER_ARCHIVE")"
+  if [ "${UPDATER_MTIME:-0}" -lt "$BUILD_START" ]; then
+    echo "ERROR: updater archive is older than this build start; refusing to publish stale output." >&2
+    exit 1
+  fi
 fi
 
 echo "==> [4/5] hdiutil: wrapping into .dmg"

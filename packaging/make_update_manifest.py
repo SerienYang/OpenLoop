@@ -53,19 +53,39 @@ def main() -> int:
     ap.add_argument(
         "--notes", default="", help="release notes line shown in the update prompt"
     )
+    ap.add_argument(
+        "--required-platform",
+        action="append",
+        choices=sorted(ARTIFACTS.values()),
+        default=[],
+        help="platform that must have both artifact and signature; repeat as needed",
+    )
     args = ap.parse_args()
 
     platforms: dict[str, dict[str, str]] = {}
+    required = set(args.required_platform)
     for asset, platform in ARTIFACTS.items():
         artifact = args.dist / asset
         sig = args.dist / (asset + ".sig")
         if not artifact.exists():
+            if platform in required:
+                print(
+                    f"error: required updater artifact is missing: {asset}",
+                    file=sys.stderr,
+                )
+                return 1
             print(
                 f"warning: {asset} not in {args.dist} — skipping {platform}",
                 file=sys.stderr,
             )
             continue
         if not sig.exists():
+            if platform in required:
+                print(
+                    f"error: required updater signature is missing: {sig.name}",
+                    file=sys.stderr,
+                )
+                return 1
             print(
                 f"warning: {asset} has no .sig — skipping {platform} (unsigned updates never install)",
                 file=sys.stderr,
@@ -75,6 +95,14 @@ def main() -> int:
             "signature": sig.read_text().strip(),
             "url": f"https://github.com/{args.repo}/releases/download/{args.tag}/{asset}",
         }
+
+    missing_required = required.difference(platforms)
+    if missing_required:
+        print(
+            f"error: required updater platforms missing: {', '.join(sorted(missing_required))}",
+            file=sys.stderr,
+        )
+        return 1
 
     if not platforms:
         print(

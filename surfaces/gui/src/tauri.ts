@@ -129,26 +129,48 @@ export async function listenDictationDownloadProgress(
 
 // --- Auto-update (desktop only; browser builds see null / throw) -----------------
 
-export type UpdateInfo = { version: string; notes: string };
+export type UpdateInfo = { updateId: string; version: string; notes: string };
+export type UpdateDownloadProgress = {
+  updateId: string;
+  version: string;
+  downloadedBytes: number;
+  totalBytes: number | null;
+};
+
+export const getAppVersion = () => invokeStrict<string>("get_app_version");
 
 /** Ask the shell whether a newer release exists (verified manifest; see lib.rs).
- * null = up to date, unreachable endpoint, or not the desktop app. */
-export const checkForUpdate = () => invoke<UpdateInfo | null>("check_for_update");
+ * null means up to date; transport and manifest failures reject. */
+export const checkForUpdate = () => invokeStrict<UpdateInfo | null>("check_for_update");
 
 /** Pre-fetch + verify the update bytes in the background so the install is instant.
  * The shell caches them keyed by version; calling again for the same version is a no-op.
  * Rejects when there is no update or the download fails — callers fall back to the
  * download-on-install path. */
-export const downloadUpdate = () => invokeStrict<void>("download_update");
+export const downloadUpdate = (updateId: string) =>
+  invokeStrict<void>("download_update", { updateId });
 
 /** Drop the pre-fetched update bundle (freed on "Later" so a dismissed release
  * doesn't pin tens of MB for a weeks-long app run). */
-export const clearPendingUpdate = () => invokeStrict<void>("clear_pending_update");
+export const clearPendingUpdate = (updateId: string) =>
+  invokeStrict<void>("clear_pending_update", { updateId });
 
 /** Install the update (pre-fetched bytes when available, else download + verify now),
  * then relaunch. Resolves only on failure paths (success restarts the process on macOS;
  * Windows hands off to the installer). */
-export const installUpdate = () => invokeStrict<void>("install_update");
+export const installUpdate = (updateId: string) =>
+  invokeStrict<void>("install_update", { updateId });
+
+export async function listenUpdateDownloadProgress(
+  handler: (progress: UpdateDownloadProgress) => void,
+): Promise<() => void> {
+  const listen = (globalThis as any).__TAURI__?.event?.listen;
+  if (!listen) return () => {};
+  return (await listen(
+    "openloop-update-download-progress",
+    (event: { payload: UpdateDownloadProgress }) => handler(event.payload),
+  )) as () => void;
+}
 
 /** Best-effort open a URL in the user's browser. Uses the Tauri opener plugin (wired up in the
  * desktop shell with the `opener:allow-open-url` + `opener:allow-default-urls` capabilities,

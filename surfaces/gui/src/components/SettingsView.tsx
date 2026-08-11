@@ -25,8 +25,6 @@ import {
   getAwakeRule,
   getAutostart,
   getDictationStatus,
-  checkForUpdate,
-  installUpdate,
   isTauri,
   listenDictationDownloadProgress,
   markDictationTestPassed,
@@ -42,6 +40,7 @@ import {
   type DictationStatus,
 } from "../tauri";
 import { useThemePref } from "../theme";
+import { UpdateSettings } from "../update/UpdateSettings";
 import { Icon } from "./Icon";
 import { PanelHead } from "./IntegrationsView";
 import { McpTab, ModelsTab } from "./ManageTabs";
@@ -725,16 +724,7 @@ function AppearanceSection() {
         </div>
       )}
 
-      <div className={CARD + " p-4"}>
-        <div className={FIELD_LABEL + " mb-2"}>{t("Updates")}</div>
-        <div className="flex items-center justify-between gap-4">
-          <span>
-            <span className="block text-[13px] text-ink">{t("Check for OpenLoop updates")}</span>
-            <span className="block text-[12px] text-muted mt-1">{t("See whether a new version is available to install.")}</span>
-          </span>
-          <UpdateInline />
-        </div>
-      </div>
+      {isTauri() && <UpdateSettings />}
     </section>
   );
 }
@@ -807,64 +797,6 @@ function FileStorageCard() {
         </button>
       </div>
     </div>
-  );
-}
-
-function UpdateInline() {
-  const { t } = useI18n();
-  const [state, setState] = useState<"idle" | "checking" | "none" | "found" | "installing" | "error">("idle");
-  const [version, setVersion] = useState("");
-
-  const check = async () => {
-    setState("checking");
-    try {
-      const u = await checkForUpdate();
-      if (u) {
-        setVersion(u.version);
-        setState("found");
-      } else {
-        setState("none");
-      }
-    } catch {
-      setState("error");
-    }
-  };
-
-  const install = async () => {
-    setState("installing");
-    try {
-      await installUpdate(); // success restarts the app
-    } catch {
-      setState("error");
-    }
-  };
-
-  return (
-    <span className="inline-flex items-center gap-2.5">
-      {state === "found" ? (
-        <button className={BTN_BORDERED} onClick={install} data-testid="settings-update-install">
-          {t("Update to v{{version}} and restart", { version })}
-        </button>
-      ) : (
-        <button
-          className={BTN_BORDERED}
-          onClick={check}
-          disabled={state === "checking" || state === "installing"}
-          data-testid="settings-update-check"
-        >
-          {state === "checking" ? t("Checking…") : t("Check for updates")}
-        </button>
-      )}
-      {(state === "none" || state === "error" || state === "installing") && (
-        <span className="text-[12px] text-muted">
-          {state === "none"
-            ? t("You're on the latest version.")
-            : state === "error"
-              ? t("Couldn't check right now — try again later.")
-              : t("Downloading — OpenLoop restarts by itself when it's ready.")}
-        </span>
-      )}
-    </span>
   );
 }
 

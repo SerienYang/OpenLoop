@@ -4,6 +4,7 @@ import { App } from "./App";
 import { I18nProvider } from "./i18n";
 import { initTheme } from "./theme";
 import { isTauri, openExternal, platformOS } from "./tauri";
+import { UpdateProvider } from "./update/UpdateProvider";
 import "./tailwind.css";
 import "./styles.css";
 
@@ -41,7 +42,9 @@ if (isTauri()) {
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <I18nProvider>
-      <App />
+      <UpdateProvider>
+        <App />
+      </UpdateProvider>
     </I18nProvider>
   </React.StrictMode>,
 );
