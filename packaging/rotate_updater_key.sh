@@ -16,6 +16,7 @@ PYTHON="${OPENLOOP_KEY_ROTATION_PYTHON:-$ROOT/.venv/bin/python}"
 DEFAULT_KEY_ROOT="$HOME/.config/openloop/keys"
 CONFIRM_PHRASE="ROTATE OPENLOOP UPDATER KEY"
 TEMP_ROOT=""
+TEMP_ROOT_PARENT=""
 TRANSACTION_ACTIVE=0
 SNAPSHOT_DIR=""
 KEY_STAGE=""
@@ -55,7 +56,7 @@ cleanup() {
       && [[ "$KEY_STAGE" == "$KEY_STAGE_ROOT"/.partial-pending.* ]] \
       && [ -d "$KEY_STAGE" ] \
       && [ ! -L "$KEY_STAGE" ] \
-      && [ "$(stat -f %u "$KEY_STAGE" 2>/dev/null || echo -1)" = "$(id -u)" ]; then
+      && [ -O "$KEY_STAGE" ]; then
       if [ -f "$KEY_STAGE/updater.key" ]; then
         echo "Updater key generation was interrupted; resume the same key with:" >&2
         echo "  bash packaging/rotate_updater_key.sh resume-prepare --key-dir $KEY_STAGE" >&2
@@ -72,9 +73,9 @@ cleanup() {
   fi
   if [ "$preserve_temp" -eq 0 ] \
     && [ -n "$TEMP_ROOT" ] \
-    && [[ "$TEMP_ROOT" == /private/tmp/openloop-updater-key.* ]] \
+    && [[ "$TEMP_ROOT" == "${TEMP_ROOT_PARENT:-$(temp_root_parent)}"/openloop-updater-key.* ]] \
     && [ -d "$TEMP_ROOT" ] \
-    && [ "$(stat -f %u "$TEMP_ROOT" 2>/dev/null || echo -1)" = "$(id -u)" ]; then
+    && [ -O "$TEMP_ROOT" ]; then
     rm -rf "$TEMP_ROOT"
   fi
   exit "$status"
@@ -90,6 +91,19 @@ on_terminate() {
 trap cleanup EXIT
 trap on_interrupt INT
 trap on_terminate TERM
+
+temp_root_parent() {
+  base="${TMPDIR:-/tmp}"
+  base="${base%/}"
+  [ -n "$base" ] || base="/tmp"
+  printf '%s\n' "$base"
+}
+
+make_temp_root() {
+  TEMP_ROOT_PARENT="$(temp_root_parent)"
+  mkdir -p "$TEMP_ROOT_PARENT"
+  mktemp -d "$TEMP_ROOT_PARENT/openloop-updater-key.XXXXXX"
+}
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -460,7 +474,7 @@ prepare_command() {
   mkdir -p "$backup_dir"
   mkdir -p "$key_root"
   chmod 700 "$key_root"
-  TEMP_ROOT="$(mktemp -d /private/tmp/openloop-updater-key.XXXXXX)"
+  TEMP_ROOT="$(make_temp_root)"
   repository_json "$repo" > "$TEMP_ROOT/repository-raw.json"
   normalize_repository_json "$TEMP_ROOT/repository-raw.json" "$TEMP_ROOT/repository.json"
   volume_details "$backup_dir" "$TEMP_ROOT/volume.json"
@@ -498,7 +512,7 @@ resume_prepare_command() {
     exit 2
   }
   ensure_common_tools
-  TEMP_ROOT="$(mktemp -d /private/tmp/openloop-updater-key.XXXXXX)"
+  TEMP_ROOT="$(make_temp_root)"
   key_dir="$("$PYTHON" "$HELPER" validate-path \
     --path "$key_dir" --repo-root "$ROOT" --allow-non-volume)"
   if [[ "$(basename "$key_dir")" == .partial-pending.* ]]; then
@@ -529,7 +543,7 @@ verify_backup_command() {
   done
   [ -n "$backup_path" ] || { echo "error: --backup-path is required" >&2; exit 2; }
   ensure_common_tools
-  TEMP_ROOT="$(mktemp -d /private/tmp/openloop-updater-key.XXXXXX)"
+  TEMP_ROOT="$(make_temp_root)"
   backup_path="$(validate_backup_path "$backup_path" "$allow_non_volume")"
   "$PYTHON" "$HELPER" verify-checksums --key-dir "$backup_path"
   sign_and_verify "$backup_path/updater.key" "$backup_path/updater.pub" 0
@@ -554,7 +568,7 @@ activate_command() {
     return
   fi
   ensure_common_tools
-  TEMP_ROOT="$(mktemp -d /private/tmp/openloop-updater-key.XXXXXX)"
+  TEMP_ROOT="$(make_temp_root)"
   key_dir="$("$PYTHON" "$HELPER" validate-path \
     --path "$key_dir" --repo-root "$ROOT" --allow-non-volume)"
   "$PYTHON" "$HELPER" verify-checksums --key-dir "$key_dir"
@@ -649,7 +663,7 @@ sync_github_command() {
   done
   [ -n "$key_dir" ] || { echo "error: --key-dir is required" >&2; exit 2; }
   ensure_common_tools
-  TEMP_ROOT="$(mktemp -d /private/tmp/openloop-updater-key.XXXXXX)"
+  TEMP_ROOT="$(make_temp_root)"
   key_dir="$("$PYTHON" "$HELPER" validate-path \
     --path "$key_dir" --repo-root "$ROOT" --allow-non-volume)"
   "$PYTHON" "$HELPER" verify-checksums --key-dir "$key_dir"
