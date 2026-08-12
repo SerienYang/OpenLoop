@@ -235,3 +235,9 @@ def test_tag_release_is_fail_closed() -> None:
     assert "no updater signatures" not in workflow
     assert 'rm -f "$UPDATER_ARCHIVE" "$UPDATER_SIGNATURE"' in build_script
     assert "updater archive is older than this build start" in build_script
+    assert 'hdiutil detach "$dev" -force >/dev/null || return 1' in build_script
+    assert (
+        'hdiutil convert "$rw" -format UDZO -imagekey zlib-level=9 -o "$DMG" >/dev/null || return 1'
+        in build_script
+    )
+    assert '[ -f "$DMG" ] || { echo "ERROR: missing DMG output: $DMG" >&2; exit 1; }' in build_script

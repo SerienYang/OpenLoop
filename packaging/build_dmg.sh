@@ -269,8 +269,8 @@ OSA
   local i; for i in $(seq 1 15); do [ -f "$mnt/.DS_Store" ] && break; sleep 1; done
   [ -f "$mnt/.DS_Store" ] || { hdiutil detach "$dev" -force >/dev/null 2>&1 || true; return 1; }
   sync; sync
-  hdiutil detach "$dev" -force >/dev/null
-  hdiutil convert "$rw" -format UDZO -imagekey zlib-level=9 -o "$DMG" >/dev/null
+  hdiutil detach "$dev" -force >/dev/null || return 1
+  hdiutil convert "$rw" -format UDZO -imagekey zlib-level=9 -o "$DMG" >/dev/null || return 1
   rm -f "$rw"
 }
 
@@ -279,6 +279,7 @@ if ! style_dmg; then
   hdiutil create -volname "$APP" -srcfolder "$STAGING" -ov -format UDZO "$DMG" >/dev/null
 fi
 rm -rf "$STAGING"
+[ -f "$DMG" ] || { echo "ERROR: missing DMG output: $DMG" >&2; exit 1; }
 
 if [ "${OPENLOOP_SKIP_NOTARIZE:-}" = "1" ] && [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
   # Local-iteration escape hatch: sign (seconds) but skip the notary round-trip
