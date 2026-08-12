@@ -32,12 +32,13 @@ class PendingStore:
         legacy = Path(legacy_path) if legacy_path else None
         source = target if target and target.is_file() else legacy
         self._store = _LegacyStore(source)
-        self._drop_notifications()
+        dropped_notifications = self._drop_notifications()
         if target is not None:
             self._store.path = target
-            self._store._save()
+            if source != target or dropped_notifications:
+                self._store._save()
 
-    def _drop_notifications(self) -> None:
+    def _drop_notifications(self) -> bool:
         stale = [
             item_id
             for item_id, item in self._store._items.items()
@@ -45,6 +46,7 @@ class PendingStore:
         ]
         for item_id in stale:
             self._store._items.pop(item_id, None)
+        return bool(stale)
 
     @property
     def _waiters(self):

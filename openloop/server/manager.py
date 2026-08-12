@@ -636,7 +636,7 @@ class SessionManager:
                 session_id,
                 title=question,
                 inbox=inbox_name,
-                options=list(args.get("options") or []),
+                options=args.get("options"),
                 allow_text=bool(args.get("allow_text", True)),
                 multi=bool(args.get("multi", False)),
                 tool_call_id=tool_call_id,

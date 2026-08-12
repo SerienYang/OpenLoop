@@ -940,7 +940,7 @@ export interface InboxItem {
   resolved_at: string | null;
   visibility?: "inline" | "inbox";
   // Question metadata (ask_user): quick-reply choices + a free-text escape.
-  options?: string[];
+  options?: Array<string | { value: string; label: string }>;
   allow_text?: boolean;
   multi?: boolean;
   // Kind-specific payload (directory: {path, writable}; …).

@@ -16,7 +16,7 @@ import json
 from dataclasses import dataclass
 from typing import Optional
 
-from .inbox import KIND_APPROVAL, KIND_QUESTION
+from .inbox import KIND_APPROVAL, KIND_QUESTION, question_option_parts
 
 
 @dataclass
@@ -49,6 +49,14 @@ def buttons_for(item) -> list[Button]:
             Button("Deny", encode(item.id, "deny")),
         ]
     if item.kind == KIND_QUESTION and getattr(item, "options", None):
-        # One button per option; the resolution IS the chosen option text (what the agent gets).
-        return [Button(opt, encode(item.id, opt)) for opt in item.options]
+        if getattr(item, "multi", False):
+            return []
+        buttons: list[Button] = []
+        for option in item.options:
+            parts = question_option_parts(option)
+            if parts is None:
+                continue
+            label, value = parts
+            buttons.append(Button(label, encode(item.id, value)))
+        return buttons
     return []

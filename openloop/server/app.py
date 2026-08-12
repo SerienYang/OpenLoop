@@ -1200,7 +1200,7 @@ def create_app(manager: SessionManager) -> FastAPI:
                 str(args.get("question", "")),
                 inbox=_route(),
                 visibility=_visibility(),
-                options=list(args.get("options") or []),
+                options=args.get("options"),
                 allow_text=bool(args.get("allow_text", True)),
                 multi=bool(args.get("multi", False)),
                 tool_call_id=tool_call_id,
