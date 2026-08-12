@@ -527,6 +527,8 @@ def test_rotation_script_has_safe_shell_contract() -> None:
     assert "signer generate --ci" not in source
     assert "--password" not in source
     assert "set -Eeuo pipefail" in source
+    assert "/private/tmp/openloop-updater-key" not in source
+    assert "stat -f %u" not in source
     activate = source.split("activate_command()", 1)[1].split(
         "sync_bundle_secret()", 1
     )[0]
@@ -772,6 +774,93 @@ JSON
     staged_key = pathlib.Path(staging_path_log.read_text().strip())
     assert staged_key.is_relative_to(key_root)
     assert not list(key_root.glob(".partial-pending.*"))
+
+
+def test_prepare_uses_tmpdir_for_temp_root(
+    tmp_path: pathlib.Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    temp_root = tmp_path / "runner-temp"
+    temp_root.mkdir()
+    template_log = tmp_path / "mktemp-template.log"
+    write_executable(
+        fake_bin / "mktemp",
+        f"""#!/bin/bash
+set -eu
+[ "$1" = "-d" ]
+template="$2"
+printf '%s\\n' "$template" >> '{template_log}'
+prefix="${{template%XXXXXX}}"
+case "$template" in
+  "$TMPDIR"/openloop-updater-key.XXXXXX|*/.partial-pending.XXXXXX)
+    target="${{prefix}}TDD123"
+    mkdir -p "$target"
+    printf '%s\\n' "$target"
+    ;;
+  *)
+    echo "unexpected template: $template" >&2
+    exit 17
+    ;;
+esac
+""",
+    )
+    write_executable(
+        fake_bin / "npm",
+        f"""#!/bin/bash
+set -eu
+output=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--write-keys" ]; then output="$2"; shift 2; else shift; fi
+done
+[ -n "$output" ]
+printf 'encrypted-private\\n' > "$output"
+printf '%s\\n' '{NEW_PUBLIC_B64}' > "$output.pub"
+""",
+    )
+    write_executable(fake_bin / "security", "#!/bin/bash\nexit 0\n")
+    write_executable(fake_bin / "cargo", "#!/bin/bash\nexit 0\n")
+    write_executable(
+        fake_bin / "gh",
+        """#!/bin/bash
+cat <<'JSON'
+{"id":"R_kgDOT0SokQ","nameWithOwner":"SerienYang/OpenLoop","url":"https://github.com/SerienYang/OpenLoop","defaultBranchRef":{"name":"main"}}
+JSON
+""",
+    )
+    backup = tmp_path / "backup"
+    backup.mkdir()
+    key_root = tmp_path / "keys"
+    env = os.environ.copy()
+    env.update(
+        {
+            "OPENLOOP_KEY_ROTATION_TESTING": "1",
+            "TMPDIR": str(temp_root),
+            "PATH": f"{fake_bin}:{env['PATH']}",
+        }
+    )
+
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            str(ROTATION_SCRIPT),
+            "prepare",
+            "--backup-dir",
+            str(backup),
+            "--key-root",
+            str(key_root),
+            "--allow-non-volume-backup",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert template_log.read_text().splitlines()[0] == str(
+        temp_root / "openloop-updater-key.XXXXXX"
+    )
 
 
 def test_prepare_failure_after_generation_preserves_same_key_for_resume(
