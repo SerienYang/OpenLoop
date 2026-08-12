@@ -931,6 +931,7 @@ export function App() {
     setUsage(emptyUsage());
     setStreaming("");
     setTodo([]);
+    setRunning(false);
     setPendingProjectId(project?.project_id || null);
     if (project) {
       setWorkspace(project.path);
