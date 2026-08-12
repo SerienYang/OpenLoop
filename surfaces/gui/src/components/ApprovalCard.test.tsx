@@ -221,6 +221,164 @@ describe("InboxItemCard — Allow every time on parked run approvals", () => {
   });
 });
 
+describe("InboxItemCard — question option compatibility", () => {
+  const questionItem = (
+    options: InboxItem["options"],
+    extra: Partial<InboxItem> = {},
+  ): InboxItem => ({
+    id: "question-1",
+    session_id: "session-1",
+    kind: "question",
+    title: "Choose how to handle the local changes",
+    body: "",
+    state: "pending",
+    resolution: null,
+    inbox: "default",
+    created_at: "",
+    resolved_at: null,
+    options,
+    allow_text: false,
+    multi: false,
+    ...extra,
+  });
+
+  it("renders structured option labels and resolves with the visible label", () => {
+    const onResolve = vi.fn();
+    render(
+      <InboxItemCard
+        item={questionItem([
+          {
+            value: "keep_as_local",
+            label: "保留为本地修改，不一起推",
+          },
+        ])}
+        onResolve={onResolve}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "保留为本地修改，不一起推" }));
+    expect(onResolve).toHaveBeenCalledWith(
+      "question-1",
+      "保留为本地修改，不一起推",
+    );
+  });
+
+  it("keeps string options backward compatible", () => {
+    const onResolve = vi.fn();
+    render(
+      <InboxItemCard
+        item={questionItem(["Keep local"])}
+        onResolve={onResolve}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Keep local" }));
+    expect(onResolve).toHaveBeenCalledWith("question-1", "Keep local");
+  });
+
+  it("collects the visible labels from structured multi-select options", () => {
+    const onResolve = vi.fn();
+    render(
+      <InboxItemCard
+        item={questionItem(
+          [
+            {
+              value: "keep_as_local",
+              label: "保留为本地修改，不一起推",
+            },
+            {
+              value: "abort_push",
+              label: "暂不推，先停下来",
+            },
+          ],
+          { multi: true },
+        )}
+        onResolve={onResolve}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "保留为本地修改，不一起推" }));
+    fireEvent.click(screen.getByRole("button", { name: "暂不推，先停下来" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send (2)" }));
+    expect(onResolve).toHaveBeenCalledWith(
+      "question-1",
+      "保留为本地修改，不一起推, 暂不推，先停下来",
+    );
+  });
+
+  it("filters malformed options and preserves the text-answer fallback", () => {
+    const malformed = [
+      null,
+      42,
+      { value: "missing-label" },
+      { label: "missing-value" },
+      { value: 42, label: "numeric-value" },
+    ] as unknown as InboxItem["options"];
+
+    render(
+      <InboxItemCard
+        item={questionItem(malformed)}
+        onResolve={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByPlaceholderText("Your answer…")).toBeTruthy();
+    expect(screen.queryByText("missing-label")).toBeNull();
+    expect(screen.queryByText("missing-value")).toBeNull();
+    expect(screen.queryByText("numeric-value")).toBeNull();
+  });
+
+  it("treats a non-array options payload as an open text question", () => {
+    const notAnArray = {
+      value: "hidden",
+      label: "Not an array",
+    } as unknown as InboxItem["options"];
+
+    render(
+      <InboxItemCard
+        item={questionItem(notAnArray)}
+        onResolve={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByPlaceholderText("Your answer…")).toBeTruthy();
+    expect(screen.queryByText("Not an array")).toBeNull();
+  });
+
+  it("rejects the entire option set when any entry is malformed", () => {
+    const partiallyMalformed = [
+      "Valid-looking subset",
+      { value: 42, label: "Invalid entry" },
+    ] as unknown as InboxItem["options"];
+
+    render(
+      <InboxItemCard
+        item={questionItem(partiallyMalformed)}
+        onResolve={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText("Valid-looking subset")).toBeNull();
+    expect(screen.getByPlaceholderText("Your answer…")).toBeTruthy();
+  });
+
+  it("deduplicates visible labels", () => {
+    render(
+      <InboxItemCard
+        item={questionItem([
+          { value: "keep-1", label: "Keep the visible label" },
+          { value: "keep-2", label: "Keep the visible label" },
+        ])}
+        onResolve={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getAllByRole("button", { name: "Keep the visible label" }),
+    ).toHaveLength(1);
+  });
+});
+
 describe("ApprovalCard — save_skill (SKILLS-SPEC §5.2)", () => {
   const skillApproval = (extra: Partial<ApprovalItem> = {}): ApprovalItem =>
     sendApproval({

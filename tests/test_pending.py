@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -57,6 +58,50 @@ def test_persistence(tmp_path):
     store.resolve(item.id, "allow")
     reloaded = PendingStore(tmp_path / "pending.json")
     assert reloaded.get(item.id).resolution == "allow"
+
+
+def test_question_options_are_normalized_and_deduplicated(tmp_path):
+    store = PendingStore(tmp_path / "pending.json")
+    item = store.add_question(
+        "s1",
+        "How should this be handled?",
+        options=[
+            "  Keep local  ",
+            {"value": "abort_push", "label": "  Stop before pushing  "},
+            {"value": "different-hidden-value", "label": "Stop before pushing"},
+        ],
+    )
+
+    assert item.options == ["Keep local", "Stop before pushing"]
+    reloaded = PendingStore(tmp_path / "pending.json")
+    assert reloaded.get(item.id).options == item.options
+
+
+def test_question_options_reject_non_lists_and_normalize_existing_disk_data(tmp_path):
+    path = tmp_path / "pending.json"
+    store = PendingStore(path)
+    rejected = store.add_question(
+        "s1",
+        "Broken shape",
+        options={"value": "x", "label": "X"},
+    )
+    assert rejected.options == []
+    assert store.add_question("s2", "Tuple", options=("A", "B")).options == []
+    assert store.add_question("s3", "Partial", options=["A", 42]).options == []
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["items"][0]["options"] = [
+        {"value": "hidden", "label": "  Visible answer  "},
+        {"value": "other", "label": "Visible answer"},
+        {"value": "", "label": "Empty"},
+        42,
+    ]
+    raw_text = json.dumps(raw)
+    path.write_text(raw_text, encoding="utf-8")
+
+    reloaded = PendingStore(path)
+    assert reloaded.get(rejected.id).options == []
+    assert path.read_text(encoding="utf-8") == raw_text
 
 
 def test_reconcile_on_resume(tmp_path):

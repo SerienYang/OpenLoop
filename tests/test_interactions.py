@@ -47,6 +47,43 @@ def test_buttons_for_kinds(tmp_path):
     assert buttons_for(st.add_directory("s1", "Grant access?")) == []
 
 
+def test_structured_question_options_use_visible_labels_as_resolutions(tmp_path):
+    st = PendingStore(tmp_path / "pending.json")
+    question = st.add_question(
+        "s1",
+        "How should this be handled?",
+        options=[
+            {"value": "keep_as_local", "label": "Keep as a local change"},
+            {"value": "abort_push", "label": "Stop before pushing"},
+        ],
+    )
+
+    buttons = buttons_for(question)
+
+    assert [button.label for button in buttons] == [
+        "Keep as a local change",
+        "Stop before pushing",
+    ]
+    assert [decode(button.value) for button in buttons] == [
+        (question.id, "Keep as a local change"),
+        (question.id, "Stop before pushing"),
+    ]
+
+
+def test_multi_and_malformed_question_options_do_not_create_message_buttons(tmp_path):
+    st = PendingStore(tmp_path / "pending.json")
+    multi = st.add_question(
+        "s1",
+        "Choose several",
+        options=["A", "B"],
+        multi=True,
+    )
+    assert buttons_for(multi) == []
+
+    malformed = st.add_question("s2", "Broken", options=[42, {"value": "x"}])
+    assert buttons_for(malformed) == []
+
+
 def test_slack_blocks_shape():
     blocks = _slack_blocks("Run `x`?", [Button("Approve", "v1"), Button("Deny", "v2")])
     assert blocks[0]["type"] == "section"

@@ -43,6 +43,39 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def question_option_parts(option: object) -> Optional[tuple[str, str]]:
+    """Return the visible label as both ``(label, resolution)``."""
+    if isinstance(option, str):
+        label = value = option.strip()
+    elif isinstance(option, dict):
+        raw_value = option.get("value")
+        raw_label = option.get("label")
+        if not isinstance(raw_value, str) or not isinstance(raw_label, str):
+            return None
+        value = raw_value.strip()
+        label = raw_label.strip()
+    else:
+        return None
+    return (label, label) if label and value else None
+
+
+def normalize_question_options(options: Any) -> list[str]:
+    if not isinstance(options, list):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for option in options:
+        parts = question_option_parts(option)
+        if parts is None:
+            return []
+        label, value = parts
+        if value in seen:
+            continue
+        seen.add(value)
+        normalized.append(label)
+    return normalized
+
+
 def args_preview(arguments: Optional[dict], *, limit: int = 240) -> str:
     """A compact one-line summary of a tool call's arguments, for an approval card body (so a
     mirrored 'Run `write_file`?' shows *what* — path/content — not just the tool name).
@@ -100,6 +133,8 @@ class InboxStore:
         if self.path and self.path.is_file():
             data = json.loads(self.path.read_text(encoding="utf-8"))
             for raw in data.get("items", []):
+                raw = dict(raw)
+                raw["options"] = normalize_question_options(raw.get("options"))
                 item = InboxItem(**raw)
                 self._items[item.id] = item
 
@@ -143,7 +178,7 @@ class InboxStore:
             inbox=inbox,
             visibility=visibility,
             data=dict(data or {}),
-            options=list(options or []),
+            options=normalize_question_options(options),
             allow_text=bool(allow_text),
             multi=bool(multi),
             tool_call_id=tool_call_id,

@@ -47,7 +47,32 @@ export function InboxItemCard({
   const { t } = useI18n();
   const [answer, setAnswer] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
-  const options = item.options || [];
+  const options = (() => {
+    const seen = new Set<string>();
+    const candidates = Array.isArray(item.options) ? item.options : [];
+    const normalized: Array<{ value: string; label: string }> = [];
+    for (const option of candidates) {
+      if (typeof option === "string") {
+        const label = option.trim();
+        if (!label) return [];
+        if (seen.has(label)) continue;
+        seen.add(label);
+        normalized.push({ value: label, label });
+        continue;
+      }
+      if (!option || typeof option !== "object") return [];
+      const candidate = option as { value?: unknown; label?: unknown };
+      const rawValue =
+        typeof candidate.value === "string" ? candidate.value.trim() : "";
+      const label =
+        typeof candidate.label === "string" ? candidate.label.trim() : "";
+      if (!rawValue || !label) return [];
+      if (seen.has(label)) continue;
+      seen.add(label);
+      normalized.push({ value: label, label });
+    }
+    return normalized;
+  })();
   const multi = !!item.multi;
   const allowText = item.allow_text !== false;
 
@@ -140,19 +165,21 @@ export function InboxItemCard({
           {options.length > 0 && (
             <div className="flex flex-wrap gap-2 mt-2.5">
               {options.map((opt) => {
-                const on = selected.includes(opt);
+                const on = selected.includes(opt.value);
                 return (
                   <button
-                    key={opt}
+                    key={opt.value}
                     className={OPT_BASE + " " + (on ? OPT_ON : OPT_OFF)}
                     onClick={() => {
                       if (multi)
-                        setSelected((s) => (on ? s.filter((x) => x !== opt) : [...s, opt]));
-                      else onResolve(item.id, opt); // single-select resolves immediately
+                        setSelected((s) =>
+                          on ? s.filter((x) => x !== opt.value) : [...s, opt.value],
+                        );
+                      else onResolve(item.id, opt.value); // single-select resolves immediately
                     }}
                   >
                     {multi && on && <span className="text-accent text-[11px] leading-none">✓</span>}
-                    {opt}
+                    {opt.label}
                   </button>
                 );
               })}
