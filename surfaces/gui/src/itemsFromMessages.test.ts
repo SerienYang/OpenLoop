@@ -33,6 +33,69 @@ describe("itemsFromMessages _display sidecar", () => {
   });
 });
 
+describe("itemsFromMessages question answer display sidecar", () => {
+  it("rehydrates original image, PDF, and text attachment metadata", () => {
+    const attachments = [
+      {
+        kind: "image" as const,
+        name: "frame.png",
+        data_url: "data:image/png;base64,AA==",
+      },
+      {
+        kind: "pdf" as const,
+        name: "brief.pdf",
+        mime: "application/pdf",
+        data_url: "data:application/pdf;base64,JVBERg==",
+      },
+      {
+        kind: "text" as const,
+        name: "notes.md",
+        text: "# Notes",
+      },
+    ];
+
+    const items = itemsFromMessages([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Use these references" },
+          {
+            type: "image_url",
+            image_url: { url: attachments[0].data_url },
+          },
+          {
+            type: "file",
+            file: {
+              filename: "brief.pdf",
+              file_data: attachments[1].data_url,
+            },
+          },
+          {
+            type: "text",
+            text: `[Attached file: notes.md]\n${attachments[2].text}`,
+          },
+        ],
+        _question_answer_display: {
+          text: "Use these references",
+          attachments: attachments.map(({ kind, name, mime }) => ({
+            kind,
+            name,
+            ...(mime ? { mime } : {}),
+          })),
+        },
+      },
+    ]);
+
+    expect(items).toEqual([
+      {
+        kind: "user",
+        text: "Use these references",
+        attachments,
+      },
+    ]);
+  });
+});
+
 describe("itemsFromMessages timestamps", () => {
   it("carries the server ts through to user/assistant items; pre-stamp history gets none", () => {
     const items = itemsFromMessages([

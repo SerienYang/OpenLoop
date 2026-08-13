@@ -596,6 +596,7 @@ export async function mockApi(page: import("@playwright/test").Page) {
             arguments: { command: "ls" },
             reason: "OpenLoop wants to run a command.",
           });
+          send("pending_registered", { id: "pending-run-shell", kind: "approval" });
           return; // suspended on the approval
         }
         // §35 compact row: a routine workspace write (content rides in the args).
@@ -607,6 +608,7 @@ export async function mockApi(page: import("@playwright/test").Page) {
           };
           send("tool_proposed", { name: "write_file", arguments: args });
           send("permission_required", { name: "write_file", arguments: args, reason: "" });
+          send("pending_registered", { id: "pending-write-file", kind: "approval" });
           return; // suspended on the approval
         }
         // A one-paragraph digest with NO newlines — the owner-repro shape that once
@@ -622,6 +624,7 @@ export async function mockApi(page: import("@playwright/test").Page) {
           };
           send("tool_proposed", { name: "send_message", arguments: args });
           send("permission_required", { name: "send_message", arguments: args, reason: "", category: "messaging" });
+          send("pending_registered", { id: "pending-long-digest", kind: "approval" });
           return;
         }
         // Standing scoped approvals (§25): an eligible connector-ish write — the event
@@ -639,6 +642,7 @@ export async function mockApi(page: import("@playwright/test").Page) {
             category: "messaging",
             standing_target: "slack:C1",
           });
+          send("pending_registered", { id: "pending-digest", kind: "approval" });
           return;
         }
         // §25 consent card: the agent proposes the automation's permission set on the
@@ -660,6 +664,7 @@ export async function mockApi(page: import("@playwright/test").Page) {
             reason: "",
             category: "automation",
           });
+          send("pending_registered", { id: "pending-automation", kind: "approval" });
           return;
         }
         // A reasoning model's turn: thinking deltas tick in slowly, then the answer —
@@ -1252,6 +1257,29 @@ export async function mockApi(page: import("@playwright/test").Page) {
       });
 
     // inbox: pending items + the outbound routing binding (inline Slack config)
+    if (/\/v1\/pending\/[^/]+\/resolve-question$/.test(p) && m === "POST") {
+      const id = decodeURIComponent(p.split("/")[p.split("/").length - 2]);
+      const it = inbox.find((x) => x.id === id);
+      const body = req.postDataJSON();
+      if (it?.kind === "question" && it.session_id === body.session_id) {
+        it.state = "resolved";
+        it.resolution = body.answer;
+        return json({
+          status: "accepted",
+          item_id: id,
+          response_id: body.response_id,
+        });
+      }
+      return json(
+        {
+          detail: {
+            status: "rejected",
+            error: "question mismatch",
+          },
+        },
+        400,
+      );
+    }
     if (/\/v1\/pending\/[^/]+\/resolve$/.test(p) && m === "POST") {
       const id = decodeURIComponent(p.split("/")[p.split("/").length - 2]);
       const it = inbox.find((x) => x.id === id);

@@ -92,6 +92,92 @@ def test_pending_routes_replace_inbox_routes(tmp_path):
     assert body["items"][0]["title"] == "Approve it?"
 
 
+def test_question_resolution_endpoint_binds_item_session_and_attachments(tmp_path):
+    manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    question = manager.pending.add_question("s1", "Show the reference")
+    approval = manager.pending.add_approval("s1", "Approve it?")
+    client = TestClient(create_app(manager))
+    image = {
+        "kind": "image",
+        "name": "reference.png",
+        "data_url": "data:image/png;base64,AA==",
+    }
+
+    wrong_kind = client.post(
+        f"/v1/pending/{approval.id}/resolve-question",
+        json={
+            "session_id": "s1",
+            "response_id": "response-approval",
+            "answer": "allow",
+            "attachments": [],
+        },
+    )
+    accepted = client.post(
+        f"/v1/pending/{question.id}/resolve-question",
+        json={
+            "session_id": "s1",
+            "response_id": "response-question",
+            "answer": "Use this",
+            "attachments": [image],
+        },
+    )
+
+    assert wrong_kind.status_code == 400
+    assert manager.pending.get(approval.id).state == "pending"
+    assert accepted.status_code == 200
+    assert accepted.json()["status"] == "accepted"
+    saved = manager.pending.question_answer(question.id)
+    assert saved["item_id"] == question.id
+    assert saved["content"][0] == {"type": "text", "text": "Use this"}
+    assert saved["content"][1]["type"] == "image_url"
+
+
+def test_generic_pending_resolve_fails_closed_for_questions(tmp_path):
+    manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    question = manager.pending.add_question("s1", "Question")
+    client = TestClient(create_app(manager))
+
+    response = client.post(
+        f"/v1/pending/{question.id}/resolve",
+        json={"resolution": "allow"},
+    )
+
+    assert response.status_code == 400
+    assert manager.pending.get(question.id).state == "pending"
+
+
+def test_legacy_ws_typed_frames_cannot_resolve_a_question(tmp_path):
+    manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    question = manager.pending.add_question("s1", "Question")
+    client = TestClient(create_app(manager))
+
+    with client.websocket_connect("/ws/session/s1") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "approval", "decision": "allow"})
+        ws.send_json({"type": "unknown"})
+        assert ws.receive_json()["type"] == "input_rejected"
+
+    assert manager.pending.get(question.id).state == "pending"
+
+
+def test_ws_approval_frame_is_bound_to_one_pending_item(tmp_path):
+    manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    first = manager.pending.add_approval("s1", "First")
+    second = manager.pending.add_approval("s1", "Second")
+    client = TestClient(create_app(manager))
+
+    with client.websocket_connect("/ws/session/s1") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        frame = {"type": "approval", "item_id": first.id, "decision": "allow"}
+        ws.send_json(frame)
+        ws.send_json(frame)
+        ws.send_json({"type": "unknown"})
+        assert ws.receive_json()["type"] == "input_rejected"
+
+    assert manager.pending.get(first.id).resolution == "allow"
+    assert manager.pending.get(second.id).state == "pending"
+
+
 def test_connector_tool_settings_and_audit_rest(tmp_path):
     client = _client(tmp_path, [])
     connectors = {
@@ -443,8 +529,18 @@ def _drain(ws, on_permission=None):
     while True:
         event = ws.receive_json()
         types.append(event["type"])
-        if event["type"] == "permission_required" and on_permission:
-            ws.send_json({"type": "approval", "decision": on_permission})
+        if (
+            event["type"] == "pending_registered"
+            and event["data"].get("kind") == "approval"
+            and on_permission
+        ):
+            ws.send_json(
+                {
+                    "type": "approval",
+                    "item_id": event["data"]["id"],
+                    "decision": on_permission,
+                }
+            )
         if event["type"] == "turn_done":
             return types
 
@@ -457,6 +553,60 @@ def test_ws_simple_turn(tmp_path):
         types = _drain(ws)
         assert "assistant_message" in types
         assert "turn_end" in types
+
+
+def test_ws_question_can_be_answered_with_attachment_over_rest(tmp_path):
+    manager = SessionManager(
+        workspace=tmp_path,
+        provider=ScriptedProvider(
+            [
+                _tool(
+                    "ask_user",
+                    {"question": "Show the reference", "options": ["Default"]},
+                    "call-question",
+                ),
+                _text("Thanks, continuing."),
+            ]
+        ),
+    )
+    client = TestClient(create_app(manager))
+    session_id = "question-attachment"
+    with client.websocket_connect(f"/ws/session/{session_id}") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "user_message", "text": "start"})
+        question = None
+        while question is None:
+            event = ws.receive_json()
+            if event["type"] == "question_requested":
+                question = event
+        item_id = question["data"]["id"]
+        assert manager.pending.get(item_id).kind == "question"
+
+        response = client.post(
+            f"/v1/pending/{item_id}/resolve-question",
+            json={
+                "session_id": session_id,
+                "response_id": "response-1",
+                "answer": "Use this image",
+                "attachments": [
+                    {
+                        "kind": "image",
+                        "name": "reference.png",
+                        "data_url": "data:image/png;base64,AA==",
+                    }
+                ],
+            },
+        )
+        assert response.json()["status"] == "accepted"
+        types = _drain(ws)
+        assert "turn_done" in types
+
+    record = manager.session_store.load(session_id)
+    answer = next(
+        message for message in record.messages if message.get("_question_response")
+    )
+    assert answer["content"][0]["text"] == "Use this image"
+    assert answer["content"][1]["type"] == "image_url"
 
 
 def test_ws_rejects_oversized_message(tmp_path):
@@ -775,15 +925,20 @@ def test_ws_session_persisted_while_parked_on_approval(tmp_path):
     with client.websocket_connect("/ws/session/persist1") as ws:
         assert ws.receive_json()["type"] == "ready"
         ws.send_json({"type": "user_message", "text": "make x.py"})
-        while ws.receive_json()["type"] != "permission_required":
-            pass
+        approval_id = None
+        while approval_id is None:
+            event = ws.receive_json()
+            if event["type"] == "pending_registered":
+                approval_id = event["data"]["id"]
         # Parked on the approval — nothing approved, turn far from done. Already saved?
         rec = manager.session_store.load("persist1")
         assert rec is not None
         roles = [m.get("role") for m in rec.messages]
         assert "user" in roles  # turn_start checkpoint
         assert "assistant" in roles  # iteration progress checkpoint
-        ws.send_json({"type": "approval", "decision": "deny"})
+        ws.send_json(
+            {"type": "approval", "item_id": approval_id, "decision": "deny"}
+        )
         while ws.receive_json()["type"] != "turn_done":
             pass
 
@@ -1239,11 +1394,21 @@ def test_always_allow_grants_survive_restart(tmp_path):
             assert ws.receive_json()["type"] == "ready"
             ws.send_json({"type": "user_message", "text": "run it"})
             asked = 0
+            approval_decision = None
             while True:
                 ev = ws.receive_json()
                 if ev["type"] == "permission_required":
                     asked += 1
-                    ws.send_json({"type": "approval", "decision": "always_command"})
+                    approval_decision = "always_command"
+                if ev["type"] == "pending_registered" and approval_decision:
+                    ws.send_json(
+                        {
+                            "type": "approval",
+                            "item_id": ev["data"]["id"],
+                            "decision": approval_decision,
+                        }
+                    )
+                    approval_decision = None
                 if ev["type"] == "turn_done":
                     break
             assert asked == expect_prompts

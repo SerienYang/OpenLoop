@@ -105,7 +105,10 @@ def deliver(item, binding: InboxBinding, sender: Optional[Sender]) -> bool:
 
 
 def resolve_from_reply(
-    reply: str, resolve: Callable[[str, str], bool]
+    reply: str,
+    resolve: Callable[[str, str], bool],
+    *,
+    kind_for: Optional[Callable[[str], str]] = None,
 ) -> Optional[bool]:
     """Correlate an inbound channel reply to its item (by the embedded id) and resolve it.
 
@@ -116,11 +119,14 @@ def resolve_from_reply(
     if not m:
         return None
     item_id = m.group(1)
+    answer = _ID_TOKEN.sub("", reply).strip()
+    if kind_for is not None and kind_for(item_id) == "question":
+        return resolve(item_id, answer)
     lowered = reply.lower()
     if _ALLOW_WORDS.search(lowered) or "👍" in reply or "✅" in reply:
         resolution = "allow"
     elif _DENY_WORDS.search(lowered) or "👎" in reply or "❌" in reply:
         resolution = "deny"
     else:
-        resolution = _ID_TOKEN.sub("", reply).strip()  # free-text answer to a question
+        resolution = answer
     return resolve(item_id, resolution)

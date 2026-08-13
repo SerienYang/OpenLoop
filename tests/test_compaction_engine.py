@@ -177,6 +177,21 @@ def test_summarizer_failure_attended_choose_trim(tmp_path):
     assert engine.compaction_state is not None and engine.compaction_state.trimmed
 
 
+def test_summarizer_failure_attended_custom_answer_does_not_trim(tmp_path):
+    provider = CompactingProvider(
+        [AssistantTurn(text="done", finish_reason="stop")], summary_fails=99
+    )
+    engine = make_engine(tmp_path,provider, messages=long_history(), cap=400)
+    engine.is_attended = lambda: True
+
+    async def asker(args, tool_call_id=None):
+        return {"answer": "Keep the full context; I will decide later"}
+
+    engine.question_asker = asker
+    collect(engine)
+    assert engine.compaction_state is None
+
+
 def test_raw_overflow_routes_into_compaction_and_retries(tmp_path):
     # Trigger never fires (huge cap) — the provider 400 is the only signal. The engine
     # must compact (force) and retry the call instead of surfacing the error.

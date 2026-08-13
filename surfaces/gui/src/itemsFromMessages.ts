@@ -32,7 +32,11 @@ export function itemsFromMessages(messages: ConversationMessage[]): Item[] {
         items.push({ kind: "connector", source: m.source });
         continue;
       }
-      const user = userItemFromContent(m.content);
+      const user =
+        m._question_answer_display &&
+        typeof m._question_answer_display === "object"
+          ? questionAnswerItemFromContent(m.content, m._question_answer_display)
+          : userItemFromContent(m.content);
       // Force-run (`/skill …`): `_display` holds the user's literal line; `content` carries
       // the model-facing framing. Render what the user typed — one truthful bubble.
       if (typeof m._display === "string" && m._display) user.text = m._display;
@@ -84,6 +88,78 @@ export function itemsFromMessages(messages: ConversationMessage[]): Item[] {
     // system messages are omitted; tool-result messages are folded into the tool row above
   }
   return items;
+}
+
+function questionAnswerItemFromContent(
+  content: any,
+  display: any,
+): Extract<Item, { kind: "user" }> {
+  const parts = Array.isArray(content) ? content : [];
+  const used = new Set<number>();
+  const attachments: Attachment[] = [];
+  for (const raw of Array.isArray(display.attachments)
+    ? display.attachments
+    : []) {
+    if (!raw || typeof raw !== "object") continue;
+    const kind = raw.kind;
+    const name = typeof raw.name === "string" ? raw.name : "attachment";
+    if (kind === "image") {
+      const index = parts.findIndex(
+        (part: any, partIndex: number) =>
+          !used.has(partIndex) &&
+          part?.type === "image_url" &&
+          typeof part.image_url?.url === "string",
+      );
+      if (index >= 0) {
+        used.add(index);
+        attachments.push({
+          kind: "image",
+          name,
+          ...(typeof raw.mime === "string" ? { mime: raw.mime } : {}),
+          data_url: parts[index].image_url.url,
+        });
+      }
+    } else if (kind === "pdf") {
+      const index = parts.findIndex(
+        (part: any, partIndex: number) =>
+          !used.has(partIndex) &&
+          part?.type === "file" &&
+          typeof part.file?.file_data === "string",
+      );
+      if (index >= 0) {
+        used.add(index);
+        attachments.push({
+          kind: "pdf",
+          name,
+          mime: typeof raw.mime === "string" ? raw.mime : "application/pdf",
+          data_url: parts[index].file.file_data,
+        });
+      }
+    } else if (kind === "text") {
+      const prefix = `[Attached file: ${name}]\n`;
+      const index = parts.findIndex(
+        (part: any, partIndex: number) =>
+          !used.has(partIndex) &&
+          part?.type === "text" &&
+          typeof part.text === "string" &&
+          part.text.startsWith(prefix),
+      );
+      if (index >= 0) {
+        used.add(index);
+        attachments.push({
+          kind: "text",
+          name,
+          ...(typeof raw.mime === "string" ? { mime: raw.mime } : {}),
+          text: parts[index].text.slice(prefix.length),
+        });
+      }
+    }
+  }
+  return {
+    kind: "user",
+    text: typeof display.text === "string" ? display.text : "",
+    ...(attachments.length ? { attachments } : {}),
+  };
 }
 
 export function userItemFromContent(content: any): Extract<Item, { kind: "user" }> {

@@ -8,6 +8,7 @@ sessions span folders.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -21,6 +22,8 @@ from typing import Any, Optional
 
 from ..agent import build_engine
 from ..agents import get_agent
+from ..attachments import build_user_content, validate_attachments
+from ..attachments import MAX_TEXT_CHARS
 from ..inbox_routing import InboxRouting
 from ..pending import PendingStore, args_preview
 from ..selfwake import WakeStore
@@ -99,6 +102,21 @@ _SCOPES = {s.value for s in Scope}
 logger = logging.getLogger("openloop.manager")
 
 
+def _connector_response_id(
+    item_id: str,
+    *,
+    platform: str,
+    chat_id: str,
+    message_id: str,
+    actor_id: str,
+    answer: str,
+) -> str:
+    payload = "\x00".join(
+        (item_id, platform, chat_id, message_id, actor_id, answer.strip())
+    )
+    return f"connector:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
+
+
 def _grants_of(engine) -> dict[str, Any]:
     """The engine's session-scoped "Always allow" approvals, in persistable shape."""
     tools = sorted(getattr(engine.permissions, "session_allow_tools", None) or ())
@@ -158,6 +176,7 @@ class SessionManager:
         self._autotitle_inflight: set[str] = set()
         self._autotitle_tasks: set[asyncio.Task] = set()
         self._autotitle_attempts: dict[str, int] = {}
+        self._question_resume_tasks: set[asyncio.Task] = set()
         self.workspace_trust = WorkspaceTrustStore()
         self._prefs_lock = threading.RLock()
         self._provider_config_lock = threading.RLock()
@@ -644,11 +663,19 @@ class SessionManager:
             if (
                 item.state != "pending"
             ):  # durable resume re-raised an already-answered prompt
-                return {"answer": item.resolution or ""}
+                return self.inbox.question_answer(item.id) or {
+                    "accepted": True,
+                    "answer": item.resolution or "",
+                    "content": item.resolution or "",
+                }
             self.persist_session(session_id)  # the pending tool call is now on disk
             await self.mirror_inbox_item(item)
-            answer = await self.inbox.wait(item.id)
-            return {"answer": answer}
+            await self.inbox.wait(item.id)
+            return self.inbox.question_answer(item.id) or {
+                "accepted": True,
+                "answer": item.resolution or "",
+                "content": item.resolution or "",
+            }
 
         return ask
 
@@ -741,12 +768,86 @@ class SessionManager:
         (or the engine was evicted) while blocked → durably resume: rebuild the engine from the
         saved thread and continue the turn."""
         item = self.inbox.get(item_id)
+        if item is not None and item.kind == "question":
+            response_id = "legacy:" + hashlib.sha256(
+                f"{item.id}\x00{resolution}".encode("utf-8")
+            ).hexdigest()
+            result = await self.resolve_question(
+                item.id,
+                expected_session_id=item.session_id,
+                response_id=response_id,
+                answer=resolution,
+            )
+            return result["status"] in {"accepted", "accepted_replay"}
         ok = self.inbox.resolve(item_id, resolution)
         if not ok or item is None:
             return ok
         if not self.is_running(item.session_id):
             await self._durable_resume(item)
         return ok
+
+    async def resolve_question(
+        self,
+        item_id: str,
+        *,
+        expected_session_id: str,
+        response_id: str,
+        answer: str,
+        attachments: Any = None,
+    ) -> dict[str, Any]:
+        if not expected_session_id or len(expected_session_id) > 1024:
+            return {"status": "rejected", "error": "Invalid session_id."}
+        if not response_id or len(response_id) > 256:
+            return {"status": "rejected", "error": "Invalid response_id."}
+        if not isinstance(answer, str) or len(answer) > MAX_TEXT_CHARS:
+            return {"status": "rejected", "error": "Invalid or oversized answer."}
+        checked = validate_attachments(attachments)
+        if checked.error is not None:
+            return {"status": "rejected", "error": checked.error}
+        text = answer.strip()
+        if not text and not checked.attachments:
+            return {"status": "rejected", "error": "An answer or attachment is required."}
+        content = build_user_content(text, checked.attachments)
+        if text:
+            resolution = text
+        else:
+            counts = {
+                kind: sum(1 for item in checked.attachments if item.get("kind") == kind)
+                for kind in ("image", "pdf", "text")
+            }
+            labels = [
+                f"{count} {kind}" for kind, count in counts.items() if count
+            ]
+            resolution = f"[{', '.join(labels)}]"
+        result = self.inbox.resolve_question(
+            item_id,
+            expected_session_id=expected_session_id,
+            response_id=response_id,
+            resolution=resolution,
+            answer_content=content,
+            answer_display={"text": text, "attachments": checked.attachments},
+        )
+        item = result.item
+        if result.status == "accepted" and item is not None:
+            if not self.is_running(item.session_id):
+                await self._durable_resume(item)
+            await self.broadcast_session(
+                item.session_id,
+                {
+                    "type": "question_resolved",
+                    "data": {
+                        "item_id": item.id,
+                        "response_id": response_id,
+                        "status": result.status,
+                    },
+                },
+            )
+        return {
+            "status": result.status,
+            "item_id": item_id,
+            "response_id": response_id,
+            **({"error": result.error} if result.error else {}),
+        }
 
     async def _durable_resume(self, item) -> None:
         if not getattr(item, "tool_call_id", None):
@@ -763,6 +864,94 @@ class SessionManager:
         finally:
             self.mark_idle(item.session_id)
             await self.broadcast_running_state()
+
+    async def reconcile_question_answers(self) -> None:
+        """Finish or clean up accepted answers left between Pending and session checkpoints."""
+        resume_by_session: dict[str, Any] = {}
+        checkpointed_items: set[str] = set()
+        blocked_items: set[str] = set()
+        unconsumed = [
+            item
+            for item in self.inbox.list(state="resolved")
+            if item.kind == "question" and "answer_content" in item.data
+        ]
+        by_session: dict[str, list[Any]] = {}
+        for item in unconsumed:
+            by_session.setdefault(item.session_id, []).append(item)
+        for session_id, session_items in by_session.items():
+            session_item_ids = {item.id for item in session_items}
+            try:
+                loaded = self.session_store.load(session_id)
+            except OSError:
+                logger.exception(
+                    "failed to inspect session %s for question recovery", session_id
+                )
+                blocked_items.update(session_item_ids)
+                continue
+            for message in (loaded.messages if loaded else []):
+                metadata = message.get("_question_response")
+                if not isinstance(metadata, list) or not metadata:
+                    continue
+                entries = [entry for entry in metadata if isinstance(entry, dict)]
+                item_ids = {
+                    str(entry.get("item_id") or "") for entry in entries
+                }
+                if not (item_ids & session_item_ids):
+                    continue
+                if len(entries) != len(metadata):
+                    blocked_items.update(item_ids)
+                    continue
+                expected_entries: list[dict[str, str]] = []
+                valid = True
+                for entry in entries:
+                    item = self.inbox.get(str(entry.get("item_id") or ""))
+                    expected = (
+                        {
+                            "session_id": item.session_id,
+                            "item_id": item.id,
+                            "response_id": str(item.data.get("response_id") or ""),
+                            "response_digest": str(
+                                item.data.get("response_digest") or ""
+                            ),
+                        }
+                        if item is not None and item.kind == "question"
+                        else None
+                    )
+                    if expected is None or entry != expected:
+                        valid = False
+                        break
+                    expected_entries.append(expected)
+                if not valid:
+                    blocked_items.update(item_ids)
+                    logger.error(
+                        "question answer recovery metadata mismatch for %s",
+                        sorted(item_ids),
+                    )
+                    continue
+                try:
+                    consumed = self.inbox.mark_question_answers_consumed(
+                        expected_entries
+                    )
+                except OSError:
+                    logger.exception(
+                        "failed to cleanup checkpointed question answers for %s",
+                        session_id,
+                    )
+                    consumed = False
+                if not consumed:
+                    blocked_items.update(item_ids)
+                    continue
+                checkpointed_items.update(item_ids)
+
+        for item in unconsumed:
+            if item.id in checkpointed_items or item.id in blocked_items:
+                continue
+            if item.tool_call_id and not self.is_running(item.session_id):
+                resume_by_session.setdefault(item.session_id, item)
+        for item in resume_by_session.values():
+            task = asyncio.create_task(self._durable_resume(item))
+            self._question_resume_tasks.add(task)
+            task.add_done_callback(self._question_resume_tasks.discard)
 
     # -- MCP --------------------------------------------------------------------
     async def prepare_mcp_tools(
@@ -2588,6 +2777,10 @@ class SessionManager:
                 self.unregister_session_client(session_id, cb)
 
     async def aclose(self) -> None:
+        for task in self._question_resume_tasks:
+            task.cancel()
+        if self._question_resume_tasks:
+            await asyncio.gather(*self._question_resume_tasks, return_exceptions=True)
         await self.scheduler.stop()
         await self.stop_gateway()
         await self.mcp.aclose()
@@ -2819,7 +3012,27 @@ class SessionManager:
                     await self.gateway.reject_interaction(event)
                 return
         already = item is not None and item.state != "pending"
-        resolved = await self.resolve_inbox(item_id, resolution)
+        if item.kind == "question":
+            response = await self.resolve_question(
+                item_id,
+                expected_session_id=item.session_id,
+                response_id=_connector_response_id(
+                    item_id,
+                    platform=str(getattr(event, "platform", "") or ""),
+                    chat_id=str(getattr(event, "chat_id", "") or ""),
+                    message_id=str(getattr(event, "message_id", "") or ""),
+                    actor_id=str(getattr(event, "user_id", "") or ""),
+                    answer=resolution,
+                ),
+                answer=resolution,
+            )
+            resolved = response["status"] in {
+                "accepted",
+                "accepted_replay",
+                "already_resolved",
+            }
+        else:
+            resolved = await self.resolve_inbox(item_id, resolution)
         if not resolved and not already:
             return
         who = getattr(event, "user_name", None) or "someone"
@@ -2861,9 +3074,43 @@ class SessionManager:
                     team_id=getattr(event.source, "team_id", None),
                 ):
                     return False
+            if item.kind == "question":
+                if not resolution.strip():
+                    return False
+                source = event.source
+                response_id = _connector_response_id(
+                    item_id,
+                    platform=str(getattr(source, "platform", "") or ""),
+                    chat_id=str(getattr(source, "chat_id", "") or ""),
+                    message_id=str(getattr(event, "message_id", "") or ""),
+                    actor_id=str(getattr(source, "user_id", "") or ""),
+                    answer=resolution,
+                )
+                task = asyncio.get_running_loop().create_task(
+                    self.resolve_question(
+                        item_id,
+                        expected_session_id=item.session_id,
+                        response_id=response_id,
+                        answer=resolution,
+                    )
+                )
+                self._question_resume_tasks.add(task)
+                task.add_done_callback(self._question_resume_tasks.discard)
+                return True
             return self.inbox.resolve(item_id, resolution)
 
-        return resolve_from_reply(text, _resolve) is not None
+        return (
+            resolve_from_reply(
+                text,
+                _resolve,
+                kind_for=lambda item_id: (
+                    self.inbox.get(item_id).kind
+                    if self.inbox.get(item_id) is not None
+                    else ""
+                ),
+            )
+            is not None
+        )
 
     # -- self-wake resumption ---------------------------------------------------
     async def resume_due_wakes(self) -> int:
@@ -3437,27 +3684,49 @@ class SessionManager:
                     managed_root = str(root_path)
             except OSError:
                 pass
-        self.session_store.save(
-            SessionRecord(
-                session_id=session_id,
-                workspace=workspace,
-                project_id=project_id,
-                workspace_kind=workspace_kind,
-                managed_root=managed_root,
-                model=engine.model,
-                mode=engine.permissions.mode.value,
-                messages=engine.messages,
-                title=title_from(engine.messages),
-                agent=getattr(engine, "agent_name", "openloop"),
-                extra_roots=self._extra_roots_of(engine),
-                grants=_grants_of(engine),
-                compaction=(
-                    engine.compaction_state.as_dict()
-                    if getattr(engine, "compaction_state", None)
-                    else {}
-                ),
-            )
+        record = SessionRecord(
+            session_id=session_id,
+            workspace=workspace,
+            project_id=project_id,
+            workspace_kind=workspace_kind,
+            managed_root=managed_root,
+            model=engine.model,
+            mode=engine.permissions.mode.value,
+            messages=engine.messages,
+            title=title_from(engine.messages),
+            agent=getattr(engine, "agent_name", "openloop"),
+            extra_roots=self._extra_roots_of(engine),
+            grants=_grants_of(engine),
+            compaction=(
+                engine.compaction_state.as_dict()
+                if getattr(engine, "compaction_state", None)
+                else {}
+            ),
         )
+        if getattr(engine, "_message_rewrite_required", False):
+            self.session_store.replace_messages(session_id, engine.messages)
+        self.session_store.save(record)
+        engine._message_rewrite_required = False
+        for message in engine.messages:
+            metadata = message.get("_question_response")
+            if not isinstance(metadata, list) or not metadata:
+                continue
+            entries = [
+                {
+                    "item_id": str(entry.get("item_id") or ""),
+                    "response_id": str(entry.get("response_id") or ""),
+                    "response_digest": str(entry.get("response_digest") or ""),
+                }
+                for entry in metadata
+                if isinstance(entry, dict) and entry.get("session_id") == session_id
+            ]
+            if len(entries) != len(metadata):
+                logger.error("invalid grouped question response metadata")
+                continue
+            try:
+                self.inbox.mark_question_answers_consumed(entries)
+            except OSError:
+                logger.exception("failed to cleanup consumed question answers")
 
     @staticmethod
     def _apply_grants(engine: TurnEngine, grants: dict[str, Any]) -> None:

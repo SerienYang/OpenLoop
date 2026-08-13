@@ -13,6 +13,7 @@ import {
   getInbox,
   getUnattended,
   resolveInboxItem,
+  resolveQuestionItem,
   deleteSession,
   renameSession,
   runAutomation,
@@ -309,6 +310,22 @@ export function App() {
   }, []);
 
   const sessionRef = useRef<Session | null>(null);
+  const activeSessionIdRef = useRef(sessionId);
+  activeSessionIdRef.current = sessionId;
+  const localQuestionResponsesRef = useRef(
+    new Map<
+      string,
+      {
+        itemId: string;
+        sessionId: string;
+        answer: string;
+        attachments: Attachment[];
+        rendered: boolean;
+      }
+    >(),
+  );
+  const completedLocalQuestionResponsesRef = useRef(new Set<string>());
+  const pendingRegistrationRef = useRef<Record<string, Item>>({});
   const sessionSelectionEpoch = useRef(0);
   const sessionSelectionTarget = useRef<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -320,6 +337,9 @@ export function App() {
     sessionSelectionEpoch.current += 1;
     sessionSelectionTarget.current = null;
   };
+  useEffect(() => {
+    pendingRegistrationRef.current = {};
+  }, [sessionId]);
 
   const refreshProjects = useCallback(() => {
     getProjects().then(setRegisteredProjects).catch(() => setRegisteredProjects([]));
@@ -571,28 +591,30 @@ export function App() {
         case "permission_required":
           // Unattended → the backend parked it in the Inbox; don't also surface a live card.
           if (unattendedRef.current) break;
-          setItems((p) => [
-            ...p,
-            {
-              kind: "approval",
-              name: d.name,
-              args: d.arguments,
-              reason: d.reason,
-              category: d.category,
-              standingTarget: d.standing_target || undefined,
-            },
-          ]);
+          pendingRegistrationRef.current.approval = {
+            kind: "approval",
+            name: d.name,
+            args: d.arguments,
+            reason: d.reason,
+            category: d.category,
+            standingTarget: d.standing_target || undefined,
+          };
           break;
         case "directory_requested":
           if (unattendedRef.current) break;
-          setItems((p) => [
-            ...p,
-            { kind: "dirreq", reason: d.reason || "", path: d.path || "", writable: !!d.writable },
-          ]);
+          pendingRegistrationRef.current.directory = {
+            kind: "dirreq",
+            reason: d.reason || "",
+            path: d.path || "",
+            writable: !!d.writable,
+          };
           break;
         case "plan_proposed":
           if (unattendedRef.current) break;
-          setItems((p) => [...p, { kind: "planreq", plan: d.plan || "" }]);
+          pendingRegistrationRef.current.plan = {
+            kind: "planreq",
+            plan: d.plan || "",
+          };
           break;
         case "question_requested":
           // ask_user in an attended session — answered inline (not routed to the Inbox).
@@ -600,12 +622,52 @@ export function App() {
             ...p,
             {
               kind: "question",
+              id: d.id || "",
               question: d.question || "",
               options: d.options || [],
               allow_text: d.allow_text !== false,
               multi: !!d.multi,
             },
           ]);
+          break;
+        case "question_resolved":
+          if (d.item_id) {
+            if (completedLocalQuestionResponsesRef.current.has(d.response_id)) break;
+            const local = localQuestionResponsesRef.current.get(d.response_id);
+            if (local) {
+              if (
+                activeSessionIdRef.current === local.sessionId &&
+                !local.rendered
+              ) {
+                setItems((current) =>
+                  appendQuestionAnswer(
+                    current,
+                    local.itemId,
+                    local.answer,
+                    local.attachments,
+                    t("Attachment answer"),
+                  ),
+                );
+                local.rendered = true;
+              }
+              break;
+            }
+            setItems((current) =>
+              resolveQuestionById(current, d.item_id, t("Answered elsewhere")),
+            );
+            setSessionInbox((current) =>
+              current.filter((item) => item.id !== d.item_id),
+            );
+          }
+          break;
+        case "pending_registered":
+          if (d.id && d.kind) {
+            const pending = pendingRegistrationRef.current[d.kind];
+            if (pending) {
+              setItems((current) => [...current, { ...pending, id: d.id } as Item]);
+              delete pendingRegistrationRef.current[d.kind];
+            }
+          }
           break;
         case "tool_finished":
           setItems((p) =>
@@ -793,26 +855,108 @@ export function App() {
   // the 4s poll restores anything genuinely still pending.
   const dropSessionInbox = (kind: string) =>
     setSessionInbox((cur) => cur.filter((it) => it.kind !== kind));
-  const approve = (decision: ApprovalDecision) => {
+  const approve = (itemId: string | undefined, decision: ApprovalDecision) => {
+    if (!itemId) return;
     setItems((p) => resolveLastApproval(p, decision));
     dropSessionInbox("approval");
-    sessionRef.current?.approve(decision);
+    sessionRef.current?.approve(itemId, decision);
   };
-  const respondPlan = (approved: boolean, mode?: string, feedback?: string) => {
+  const respondPlan = (
+    itemId: string | undefined,
+    approved: boolean,
+    mode?: string,
+    feedback?: string,
+  ) => {
+    if (!itemId) return;
     setItems((p) => resolveLastPlan(p, approved ? "approved" : "rejected"));
     dropSessionInbox("plan");
-    sessionRef.current?.respondPlan(approved, mode, feedback);
+    sessionRef.current?.respondPlan(itemId, approved, mode, feedback);
     if (approved && mode) setMode(mode); // the server flips the live engine to this mode
   };
-  const respondDirectory = (granted: boolean, path?: string, writable?: boolean) => {
+  const respondDirectory = (
+    itemId: string | undefined,
+    granted: boolean,
+    path?: string,
+    writable?: boolean,
+  ) => {
+    if (!itemId) return;
     setItems((p) => resolveLastDirReq(p, granted ? "granted" : "denied"));
     dropSessionInbox("directory");
-    sessionRef.current?.respondDirectory(granted, path, writable);
+    sessionRef.current?.respondDirectory(itemId, granted, path, writable);
   };
-  const answerQuestion = (answer: string) => {
-    setItems((p) => resolveLastQuestion(p, answer));
-    dropSessionInbox("question");
-    sessionRef.current?.respondQuestion(answer);
+  const answerQuestion = async (
+    itemId: string,
+    expectedSessionId: string,
+    responseId: string,
+    answer: string,
+    attachments: Attachment[],
+  ) => {
+    localQuestionResponsesRef.current.set(responseId, {
+      itemId,
+      sessionId: expectedSessionId,
+      answer,
+      attachments,
+      rendered: false,
+    });
+    let result;
+    try {
+      result = await resolveQuestionItem(itemId, {
+        session_id: expectedSessionId,
+        response_id: responseId,
+        answer,
+        attachments,
+      });
+    } catch (error) {
+      localQuestionResponsesRef.current.delete(responseId);
+      throw error;
+    }
+    const local = localQuestionResponsesRef.current.get(responseId);
+    if (activeSessionIdRef.current !== expectedSessionId) {
+      localQuestionResponsesRef.current.delete(responseId);
+      return result;
+    }
+    if (result.status === "accepted" || result.status === "accepted_replay") {
+      if (!local?.rendered) {
+        setItems((current) =>
+          appendQuestionAnswer(
+            current,
+            itemId,
+            answer,
+            attachments,
+            t("Attachment answer"),
+          ),
+        );
+      }
+      setSessionInbox((current) => current.filter((item) => item.id !== itemId));
+      refreshSessions();
+      if (completedLocalQuestionResponsesRef.current.size >= 100) {
+        completedLocalQuestionResponsesRef.current.clear();
+      }
+      completedLocalQuestionResponsesRef.current.add(responseId);
+    } else if (result.status === "already_resolved") {
+      setItems((current) => resolveQuestionById(current, itemId, t("Answered elsewhere")));
+      setSessionInbox((current) => current.filter((item) => item.id !== itemId));
+    }
+    localQuestionResponsesRef.current.delete(responseId);
+    return result;
+  };
+  const resolvePendingItem = async (
+    id: string,
+    resolution: string,
+    responseId?: string,
+  ) => {
+    const item = sessionInbox.find((candidate) => candidate.id === id);
+    if (item?.kind === "question") {
+      return answerQuestion(
+        id,
+        item.session_id,
+        responseId || newId(),
+        resolution,
+        [],
+      );
+    }
+    await resolveSessionInbox(id, resolution);
+    return { status: "accepted", item_id: id, response_id: "" };
   };
   const prefillComposer = (text: string, attachments?: Attachment[]) =>
     setComposerPrefill((p) => ({ text, attachments, nonce: (p?.nonce ?? 0) + 1 }));
@@ -1003,6 +1147,13 @@ export function App() {
   const pendingDirReq = [...items].reverse().find((i) => i.kind === "dirreq" && !i.resolved);
   const pendingPlan = [...items].reverse().find((i) => i.kind === "planreq" && !i.resolved);
   const pendingQuestion = [...items].reverse().find((i) => i.kind === "question" && !i.resolved);
+  const pendingInboxQuestion = sessionInbox.find((item) => item.kind === "question");
+  const activeQuestion =
+    pendingQuestion?.kind === "question"
+      ? { id: pendingQuestion.id, sessionId }
+      : pendingInboxQuestion
+        ? { id: pendingInboxQuestion.id, sessionId: pendingInboxQuestion.session_id }
+        : null;
   // Facts subtitle (§22): the session's FIXED facts, not controls — model (+ the
   // workspace folder for project-scoped sessions). Renders only once the session has history;
   // until then the model is still choosable in the composer, so there's no locked fact to state.
@@ -1332,7 +1483,14 @@ export function App() {
                 <>
                   <Transcript
                     items={items}
-                    onApprove={approve}
+                    onApprove={(decision) =>
+                      approve(
+                        pendingApproval?.kind === "approval"
+                          ? pendingApproval.id
+                          : undefined,
+                        decision,
+                      )
+                    }
                     running={running}
                     onRetry={retry}
                     // §33 ref #3: sub-threshold streamed text renders INSIDE the live turn
@@ -1419,20 +1577,51 @@ export function App() {
                   ? t("Describe the outcome, paste content, or drop files")
                   : t("Ask OpenLoop…  (drop or paste files)")
               }
+              questionAnswer={
+                activeQuestion
+                  ? {
+                      itemId: activeQuestion.id,
+                      sessionId: activeQuestion.sessionId,
+                      onSubmit: (responseId, text, attachments) =>
+                        answerQuestion(
+                          activeQuestion.id,
+                          activeQuestion.sessionId,
+                          responseId,
+                          text,
+                          attachments,
+                        ),
+                    }
+                  : undefined
+              }
               approvalSlot={
                 // Live inline cards are for ATTENDED sessions only; when Unattended the prompt is
                 // parked in the Inbox and surfaced via the answer-in-context card below.
                 !unattended && pendingPlan?.kind === "planreq" ? (
-                  <PlanCard item={pendingPlan} onRespond={respondPlan} />
+                  <PlanCard
+                    item={pendingPlan}
+                    onRespond={(approved, mode, feedback) =>
+                      respondPlan(pendingPlan.id, approved, mode, feedback)
+                    }
+                  />
                 ) : !unattended && pendingDirReq?.kind === "dirreq" ? (
-                  <DirectoryRequestCard item={pendingDirReq} onRespond={respondDirectory} />
+                  <DirectoryRequestCard
+                    item={pendingDirReq}
+                    onRespond={(granted, path, writable) =>
+                      respondDirectory(pendingDirReq.id, granted, path, writable)
+                    }
+                  />
                 ) : !unattended && pendingApproval?.kind === "approval" ? (
-                  <ApprovalCard item={pendingApproval} onApprove={approve} runTask={runContext} compact />
+                  <ApprovalCard
+                    item={pendingApproval}
+                    onApprove={(decision) => approve(pendingApproval.id, decision)}
+                    runTask={runContext}
+                    compact
+                  />
                 ) : !unattended && pendingQuestion?.kind === "question" ? (
                   // Live ask_user in an attended session — answer inline (reuses the Inbox card UI).
                   <InboxItemCard
                     item={{
-                      id: "live-question",
+                      id: pendingQuestion.id,
                       session_id: sessionId,
                       kind: "question",
                       title: pendingQuestion.question,
@@ -1446,12 +1635,20 @@ export function App() {
                       allow_text: pendingQuestion.allow_text,
                       multi: pendingQuestion.multi,
                     }}
-                    onResolve={(_id, answer) => answerQuestion(answer)}
+                    onResolve={(id, answer, responseId) =>
+                      answerQuestion(
+                        id,
+                        sessionId,
+                        responseId || newId(),
+                        answer,
+                        [],
+                      )
+                    }
                     compact
                   />
                 ) : sessionInbox[0] ? (
                   // Unattended session blocked on an Inbox item — answer it in context.
-                  <InboxItemCard item={sessionInbox[0]} onResolve={resolveSessionInbox} compact />
+                  <InboxItemCard item={sessionInbox[0]} onResolve={resolvePendingItem} compact />
                 ) : undefined
               }
             />
@@ -1575,14 +1772,28 @@ function resolveLastPlan(items: Item[], resolved: "approved" | "rejected"): Item
   return copy;
 }
 
-function resolveLastQuestion(items: Item[], answer: string): Item[] {
-  const copy = [...items];
-  for (let i = copy.length - 1; i >= 0; i--) {
-    const it = copy[i];
-    if (it.kind === "question" && !it.resolved) {
-      copy[i] = { ...it, resolved: answer };
-      break;
-    }
-  }
-  return copy;
+function resolveQuestionById(items: Item[], id: string, answer: string): Item[] {
+  return items.map((item) =>
+    item.kind === "question" && item.id === id && !item.resolved
+      ? { ...item, resolved: answer }
+      : item,
+  );
+}
+
+function appendQuestionAnswer(
+  items: Item[],
+  id: string,
+  answer: string,
+  attachments: Attachment[],
+  attachmentFallback: string,
+): Item[] {
+  return [
+    ...resolveQuestionById(items, id, answer || attachmentFallback),
+    {
+      kind: "user",
+      text: answer,
+      attachments,
+      ts: Date.now() / 1000,
+    },
+  ];
 }

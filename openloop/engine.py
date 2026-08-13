@@ -124,6 +124,7 @@ class TurnEngine:
         # TOOL_FINISHED event can carry the note to the tool card (§25).
         self._standing_notes: dict[str, str] = {}
         self._interrupt_hooks: list[Callable[[], None]] = list(interrupt_hooks or [])
+        self._message_rewrite_required = False
 
     # -- external controls ------------------------------------------------------
     def request_interrupt(self) -> None:
@@ -278,7 +279,10 @@ class TurnEngine:
             return
         self._cancel.clear()
         yield Event(EventType.TURN_START, {"input": "(resumed)"})
-        async for event in self._handle_tool_calls(pending):
+        deferred = self._deferred_answers_for_trailing_tool_calls()
+        async for event in self._handle_tool_calls(
+            pending, initial_deferred_answers=deferred
+        ):
             yield event
         yield Event(EventType.ITERATION_END, {"iteration": 0})
         if not self._cancel.is_set():
@@ -310,6 +314,24 @@ class TurnEngine:
                     )
                 return out
         return []
+
+    def _deferred_answers_for_trailing_tool_calls(self) -> list[dict[str, Any]]:
+        tool_call_ids: set[str] = set()
+        for message in reversed(self.messages):
+            if message.get("role") == "user":
+                break
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                tool_call_ids = {
+                    str(call.get("id") or "") for call in message["tool_calls"]
+                }
+                break
+        return [
+            dict(message["_question_answer_deferred"])
+            for message in self.messages
+            if message.get("role") == "tool"
+            and message.get("tool_call_id") in tool_call_ids
+            and isinstance(message.get("_question_answer_deferred"), dict)
+        ]
 
     async def _loop(self) -> AsyncIterator[Event]:
         iterations = 0
@@ -487,6 +509,7 @@ class TurnEngine:
 
         state: Optional[_compaction.CompactionState] = None
         failed = False
+        allow_trim = True
         for _attempt in range(2):  # first try + the unconditional single retry
             try:
                 state = await asyncio.to_thread(_build)
@@ -504,14 +527,18 @@ class TurnEngine:
                                 "condense this session's history. How should I proceed?"
                             ),
                             "options": ["Retry", "Trim oldest 10%"],
-                            "allow_text": False,
+                            "allow_text": True,
                             "header": "Compaction",
                         },
                         None,
                     ),
                     interrupted=None,
                 )
-                if not answer or answer.get("answer") != "Retry":
+                choice = str((answer or {}).get("answer") or "")
+                if choice == "Trim oldest 10%":
+                    break
+                if choice != "Retry":
+                    allow_trim = False
                     break
                 try:
                     state = await asyncio.to_thread(_build)
@@ -523,7 +550,7 @@ class TurnEngine:
             self.compaction_state = state
             self._last_context_tokens = None  # stale once the outbound view shrank
             return "Context compacted — earlier turns were summarized"
-        if failed or force:
+        if (failed or force) and allow_trim:
             trimmed = _compaction.trim_state(self.messages, prior=self.compaction_state)
             if trimmed is not None:
                 self.compaction_state = trimmed
@@ -582,12 +609,17 @@ class TurnEngine:
                 return
 
     async def _handle_tool_calls(
-        self, tool_calls: list[ToolCall]
+        self,
+        tool_calls: list[ToolCall],
+        *,
+        initial_deferred_answers: Optional[list[dict[str, Any]]] = None,
     ) -> AsyncIterator[Event]:
         """Run one assistant turn's tool calls: authorize all of them first (sequentially —
         approval prompts are interactive), then execute. Low-risk calls (reads, searches)
         run concurrently; everything else runs one at a time in call order."""
         cleared: list[ToolCall] = []
+        deferred_answers: list[dict[str, Any]] = list(initial_deferred_answers or [])
+        self._deferred_question_answers = deferred_answers
         for tool_call in tool_calls:
             if self._cancel.is_set():
                 # Stopped: every remaining call still gets an answer (no orphans).
@@ -647,6 +679,66 @@ class TurnEngine:
             self._audit(tool_call, stage="started")
             result, status = await asyncio.to_thread(self._execute_sync, tool_call)
             yield self._record_result(tool_call, result, status)
+
+        if deferred_answers:
+            content_parts: list[dict[str, Any]] = []
+            recovery: list[dict[str, str]] = []
+            display_text: list[str] = []
+            display_attachments: list[dict[str, Any]] = []
+            for answer in deferred_answers:
+                content = answer.get("content")
+                if isinstance(content, str):
+                    if content:
+                        content_parts.append({"type": "text", "text": content})
+                elif isinstance(content, list):
+                    content_parts.extend(
+                        dict(part) for part in content if isinstance(part, dict)
+                    )
+                recovery.append(
+                    {
+                        "session_id": str(answer.get("session_id") or ""),
+                        "item_id": str(answer.get("item_id") or ""),
+                        "response_id": str(answer.get("response_id") or ""),
+                        "response_digest": str(answer.get("response_digest") or ""),
+                    }
+                )
+                display = answer.get("display")
+                if isinstance(display, dict):
+                    if display.get("text"):
+                        display_text.append(str(display["text"]))
+                    if isinstance(display.get("attachments"), list):
+                        display_attachments.extend(
+                            {
+                                key: item[key]
+                                for key in ("kind", "name", "mime")
+                                if key in item
+                            }
+                            for item in display["attachments"]
+                            if isinstance(item, dict)
+                        )
+            if content_parts:
+                content: Any = (
+                    content_parts[0]["text"]
+                    if len(content_parts) == 1
+                    and content_parts[0].get("type") == "text"
+                    and not display_attachments
+                    else content_parts
+                )
+                self.messages.append(
+                    {
+                        "role": "user",
+                        "content": content,
+                        "ts": time.time(),
+                        "_question_response": recovery,
+                        "_question_answer_display": {
+                            "text": "\n\n".join(display_text),
+                            "attachments": display_attachments,
+                        },
+                    }
+                )
+                for message in self.messages:
+                    if message.pop("_question_answer_deferred", None) is not None:
+                        self._message_rewrite_required = True
 
     def _interrupted_tool(self, tool_call: ToolCall) -> Event:
         """The stop-path answer for a call that will not run: a tool-error result in the
@@ -992,21 +1084,37 @@ class TurnEngine:
                 "error": "no response",
             }
 
-        status = "ok" if result.get("answer") else "denied"
-        self.messages.append(_tool_result_message(tool_call, result))
+        accepted = bool(result.get("accepted")) or bool(result.get("answer"))
+        status = "ok" if accepted else "denied"
+        raw_answer = str(result.get("answer", ""))
+        answer_summary = (
+            raw_answer
+            if len(raw_answer) <= 240
+            else raw_answer[:239].rstrip() + "…"
+        )
+        tool_result = {"answer": answer_summary}
+        if result.get("error"):
+            tool_result["error"] = str(result["error"])
+        tool_message = _tool_result_message(tool_call, tool_result)
+        if accepted and result.get("content") is not None:
+            tool_message["_question_answer_deferred"] = dict(result)
+            deferred = getattr(self, "_deferred_question_answers", None)
+            if isinstance(deferred, list):
+                deferred.append(dict(result))
+        self.messages.append(tool_message)
         self._audit(
             tool_call,
             stage="finished",
             status=status,
-            result=result,
-            result_preview=_preview(result),
+            result=tool_result,
+            result_preview=_preview(tool_result),
         )
         yield Event(
             EventType.TOOL_FINISHED,
             {
                 "name": tool_call.name,
                 "status": status,
-                "result_preview": _preview(result),
+                "result_preview": _preview(tool_result),
             },
         )
 
@@ -1037,7 +1145,16 @@ class TurnEngine:
         # (thinking text), and `usage` (token counts) — copying only messages that carry
         # one. Whole `notice` messages (error/interrupted/model-switch markers) are
         # display-only too: dropped entirely.
-        _SIDECARS = ("source", "_display", "ts", "reasoning", "usage")
+        _SIDECARS = (
+            "source",
+            "_display",
+            "_question_response",
+            "_question_answer_display",
+            "_question_answer_deferred",
+            "ts",
+            "reasoning",
+            "usage",
+        )
         # Auto-compaction (OPE-27): everything before the boundary is represented by the
         # compacted block. Outbound-only — the canonical history stays intact — and the
         # block+tail are byte-stable between turns, so prompt caching keeps working.

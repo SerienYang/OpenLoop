@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => {
     getInbox: vi.fn(),
     getUnattended: vi.fn(),
     resolveInboxItem: vi.fn(),
+    resolveQuestionItem: vi.fn(),
     deleteSession: vi.fn(),
     renameSession: vi.fn(),
     runAutomation: vi.fn(),
@@ -131,10 +132,18 @@ vi.mock("./components/Transcript", () => ({
 }));
 
 vi.mock("./components/Composer", () => ({
-  Composer: ({ placement, running }: { placement: string; running: boolean }) => (
+  Composer: ({ placement, running, questionAnswer }: any) => (
     <div data-testid="composer" data-placement={placement} data-running={String(running)}>
       <span data-testid="composer-placement">{placement}</span>
       <button type="button">{running ? "Stop" : "Send"}</button>
+      {questionAnswer && (
+        <button
+          type="button"
+          onClick={() => questionAnswer.onSubmit("response-fixed", "custom answer", [])}
+        >
+          Answer current question
+        </button>
+      )}
     </div>
   ),
 }));
@@ -247,6 +256,11 @@ beforeEach(() => {
   mocks.api.getUnattended.mockResolvedValue(false);
   mocks.api.connectEvents.mockReturnValue(() => {});
   mocks.api.resolveInboxItem.mockResolvedValue(undefined);
+  mocks.api.resolveQuestionItem.mockResolvedValue({
+    status: "accepted",
+    item_id: "question-1",
+    response_id: "response-fixed",
+  });
   mocks.api.deleteSession.mockResolvedValue({ ok: true });
   mocks.api.renameSession.mockResolvedValue({ ok: true });
   mocks.api.runAutomation.mockResolvedValue({ ok: true });
@@ -289,5 +303,40 @@ describe("App fresh session state", () => {
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Send" })).toBeTruthy();
     });
+  });
+
+  it("routes the main composer through the real pending question id", async () => {
+    render(<App />);
+    await waitFor(() => expect(mocks.sessionInstances.length).toBeGreaterThan(0));
+    const session = mocks.sessionInstances[mocks.sessionInstances.length - 1];
+
+    await act(async () => {
+      session.emit({ type: "turn_start", data: { input: "start" } });
+      session.emit({
+        type: "question_requested",
+        data: {
+          id: "question-1",
+          question: "What should I use?",
+          options: ["Default"],
+          allow_text: true,
+          multi: false,
+        },
+      });
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Answer current question" }));
+
+    await waitFor(() =>
+      expect(mocks.api.resolveQuestionItem).toHaveBeenCalledWith(
+        "question-1",
+        {
+          session_id: "session-existing",
+          response_id: "response-fixed",
+          answer: "custom answer",
+          attachments: [],
+        },
+      ),
+    );
+    expect(session.respondQuestion).not.toHaveBeenCalled();
   });
 });

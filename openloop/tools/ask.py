@@ -28,9 +28,8 @@ def ask_user_tool() -> object:
         - `question`: the full question, in plain language.
         - `options`: optional quick-reply choices. Offer them when the answer is one of a few
           discrete alternatives; leave empty for an open-ended question.
-        - `allow_text`: keep a free-text answer available even when you give options (the default;
-          this is the "Other / type your own" escape). Set False only when the options are
-          exhaustive and a typed answer would be meaningless.
+        - `allow_text`: deprecated compatibility field. OpenLoop always keeps an "Other / type
+          your own" escape because the user may need to answer with text or attachments.
         - `multi`: allow the user to pick more than one option.
         - `header`: a short (≤ ~12 char) label for the Inbox card chip, e.g. "Region".
 

@@ -5,7 +5,7 @@ import json
 
 from openloop.pending import PendingStore
 from openloop.interactions import Button, buttons_for, decode, encode
-from openloop.connectors.base import InteractionEvent
+from openloop.connectors.base import InteractionEvent, MessageEvent, SessionSource
 from openloop.connectors.senders import _slack_blocks
 from openloop.providers import ModelCapabilities, ProviderClient
 from openloop.server.manager import SessionManager
@@ -134,3 +134,53 @@ def test_interaction_click_resolves_item(tmp_path):
     asyncio.run(scenario())
     assert resolved == ["allow"]
     assert mgr.inbox.get(item.id).state == "resolved"
+
+
+def test_question_interaction_uses_structured_resolution(tmp_path):
+    mgr = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    item = mgr.inbox.add_question("sX", "Which region?", options=["us-east-1"])
+
+    async def scenario():
+        await mgr._on_interaction(
+            InteractionEvent(
+                platform="telegram",
+                chat_id="C1",
+                message_id="111.2",
+                value=encode(item.id, "us-east-1"),
+                user_id="U1",
+                user_name="bob",
+            )
+        )
+
+    asyncio.run(scenario())
+    answer = mgr.inbox.question_answer(item.id)
+    assert answer["answer"] == "us-east-1"
+    assert answer["response_id"].startswith("connector:")
+
+
+def test_question_text_reply_keeps_yes_no_as_answer_and_rejects_empty(tmp_path):
+    mgr = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    question = mgr.inbox.add_question("sX", "What should change?")
+    empty = mgr.inbox.add_question("sX", "Anything else?")
+    source = SessionSource(platform="telegram", chat_id="C1", user_id="U1")
+
+    async def scenario():
+        assert mgr._resolve_inbox_reply(
+            MessageEvent(
+                text=f"yes, use the blue version [ol:{question.id}]",
+                source=source,
+                message_id="m1",
+            )
+        )
+        assert mgr._resolve_inbox_reply(
+            MessageEvent(
+                text=f"[ol:{empty.id}]",
+                source=source,
+                message_id="m2",
+            )
+        )
+        await asyncio.gather(*mgr._question_resume_tasks)
+
+    asyncio.run(scenario())
+    assert mgr.inbox.question_answer(question.id)["answer"] == "yes, use the blue version"
+    assert mgr.inbox.get(empty.id).state == "pending"

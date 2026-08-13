@@ -3,6 +3,8 @@ continues — rebuilt from the persisted thread, with no live await."""
 
 import asyncio
 
+import pytest
+
 from openloop.providers import (
     AssistantTurn,
     ModelCapabilities,
@@ -92,6 +94,122 @@ def test_durable_resume_question(tmp_path):
     asyncio.run(scenario())
     assert any("us-west-2" in (t or "") for t in _final_assistant_texts(mgr, sid))
     assert mgr.inbox.pending(sid) == []  # nothing left pending
+
+
+def test_reconcile_resumes_accepted_question_not_yet_checkpointed(tmp_path):
+    mgr = SessionManager(
+        workspace=tmp_path,
+        provider=ScriptedProvider(
+            [
+                _tool("ask_user", {"question": "Which region?"}, "call_q"),
+                _text("Recovered the answer."),
+            ]
+        ),
+    )
+    sid = "dur-reconcile"
+
+    async def scenario():
+        engine = mgr.get_engine(sid, agent="openloop", workspace=str(tmp_path))
+        item = await _run_until_pending(mgr, sid, engine)
+        result = mgr.inbox.resolve_question(
+            item.id,
+            expected_session_id=sid,
+            response_id="response-1",
+            resolution="us-west-2",
+            answer_content="us-west-2",
+            answer_display={"text": "us-west-2", "attachments": []},
+        )
+        assert result.status == "accepted"
+        await mgr.reconcile_question_answers()
+        await asyncio.gather(*mgr._question_resume_tasks)
+
+    asyncio.run(scenario())
+    assert any("Recovered" in (t or "") for t in _final_assistant_texts(mgr, sid))
+    resolved = mgr.inbox.list(session_id=sid)[0]
+    assert "answer_content" not in resolved.data
+    assert resolved.data["answer_consumed_at"]
+
+
+def test_reconcile_restores_deferred_answer_before_second_question(tmp_path):
+    provider = ScriptedProvider(
+        [
+            AssistantTurn(
+                tool_calls=[
+                    ToolCall(
+                        id="call-q1",
+                        name="ask_user",
+                        arguments={"question": "First?"},
+                    ),
+                    ToolCall(
+                        id="call-q2",
+                        name="ask_user",
+                        arguments={"question": "Second?"},
+                    ),
+                ]
+            ),
+            _text("Recovered both answers."),
+        ]
+    )
+    mgr = SessionManager(workspace=tmp_path, provider=provider)
+    sid = "dur-two-questions"
+
+    async def scenario():
+        engine = mgr.get_engine(sid, agent="openloop", workspace=str(tmp_path))
+
+        async def run():
+            async for _ in engine.run("go"):
+                pass
+
+        task = asyncio.create_task(run())
+        first = None
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            pending = mgr.inbox.pending(sid)
+            if pending:
+                first = pending[0]
+                break
+        assert first is not None
+        mgr.inbox.resolve_question(
+            first.id,
+            expected_session_id=sid,
+            response_id="r1",
+            resolution="one",
+            answer_content="one",
+        )
+
+        second = None
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            pending = mgr.inbox.pending(sid)
+            if pending:
+                second = pending[0]
+                break
+        assert second is not None and second.id != first.id
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        mgr._engines.pop(sid, None)
+        mgr.mark_idle(sid)
+        mgr.inbox.resolve_question(
+            second.id,
+            expected_session_id=sid,
+            response_id="r2",
+            resolution="two",
+            answer_content="two",
+        )
+        await mgr.reconcile_question_answers()
+        await asyncio.gather(*mgr._question_resume_tasks)
+
+    asyncio.run(scenario())
+    record = mgr.session_store.load(sid)
+    answer_message = next(
+        message for message in record.messages if message.get("_question_response")
+    )
+    assert [part["text"] for part in answer_message["content"]] == ["one", "two"]
+    assert all(
+        "_question_answer_deferred" not in message for message in record.messages
+    )
+    assert any("Recovered both" in (text or "") for text in _final_assistant_texts(mgr, sid))
 
 
 def test_durable_resume_approval_executes_tool(tmp_path):

@@ -260,6 +260,7 @@ describe("InboxItemCard — question option compatibility", () => {
     expect(onResolve).toHaveBeenCalledWith(
       "question-1",
       "保留为本地修改，不一起推",
+      expect.any(String),
     );
   });
 
@@ -273,7 +274,11 @@ describe("InboxItemCard — question option compatibility", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Keep local" }));
-    expect(onResolve).toHaveBeenCalledWith("question-1", "Keep local");
+    expect(onResolve).toHaveBeenCalledWith(
+      "question-1",
+      "Keep local",
+      expect.any(String),
+    );
   });
 
   it("collects the visible labels from structured multi-select options", () => {
@@ -303,6 +308,7 @@ describe("InboxItemCard — question option compatibility", () => {
     expect(onResolve).toHaveBeenCalledWith(
       "question-1",
       "保留为本地修改，不一起推, 暂不推，先停下来",
+      expect.any(String),
     );
   });
 
@@ -376,6 +382,38 @@ describe("InboxItemCard — question option compatibility", () => {
     expect(
       screen.getAllByRole("button", { name: "Keep the visible label" }),
     ).toHaveLength(1);
+  });
+
+  it("always offers Other and expands free text even for legacy allow_text=false items", () => {
+    render(
+      <InboxItemCard
+        item={questionItem(["Use default"], { allow_text: false })}
+        onResolve={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByPlaceholderText("Or type your own answer…")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Other" }));
+    expect(screen.getByPlaceholderText("Or type your own answer…")).toBeTruthy();
+  });
+
+  it("reuses the response id when a question answer is retried after failure", async () => {
+    const onResolve = vi
+      .fn()
+      .mockResolvedValue({ status: "rejected", error: "Network lost" });
+    render(
+      <InboxItemCard
+        item={questionItem(["Retry me"])}
+        onResolve={onResolve}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry me" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("Network lost");
+    fireEvent.click(screen.getByRole("button", { name: "Retry me" }));
+
+    await vi.waitFor(() => expect(onResolve).toHaveBeenCalledTimes(2));
+    expect(onResolve.mock.calls[0][2]).toBe(onResolve.mock.calls[1][2]);
   });
 });
 

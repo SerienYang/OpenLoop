@@ -60,6 +60,185 @@ def test_persistence(tmp_path):
     assert reloaded.get(item.id).resolution == "allow"
 
 
+def test_resolve_question_is_idempotent_and_binds_response_to_payload(tmp_path):
+    store = PendingStore(tmp_path / "pending.json")
+    item = store.add_question("s1", "Attach the reference")
+    content = [{"type": "text", "text": "Use this"}]
+
+    accepted = store.resolve_question(
+        item.id,
+        expected_session_id="s1",
+        response_id="response-1",
+        resolution="Use this",
+        answer_content=content,
+    )
+    replay = store.resolve_question(
+        item.id,
+        expected_session_id="s1",
+        response_id="response-1",
+        resolution="Use this",
+        answer_content=content,
+    )
+    conflict = store.resolve_question(
+        item.id,
+        expected_session_id="s1",
+        response_id="response-1",
+        resolution="Changed",
+        answer_content=[{"type": "text", "text": "Changed"}],
+    )
+
+    assert accepted.status == "accepted"
+    assert replay.status == "accepted_replay"
+    assert conflict.status == "response_conflict"
+    reloaded = PendingStore(tmp_path / "pending.json")
+    saved = reloaded.get(item.id)
+    assert saved.state == STATE_RESOLVED
+    assert saved.data["answer_content"] == content
+    assert saved.data["response_id"] == "response-1"
+    assert saved.data["response_digest"].startswith("sha256:")
+
+
+def test_resolve_question_rejects_wrong_session_and_non_question(tmp_path):
+    store = PendingStore(tmp_path / "pending.json")
+    question = store.add_question("s1", "Question")
+    approval = store.add_approval("s1", "Approval")
+
+    wrong_session = store.resolve_question(
+        question.id,
+        expected_session_id="other",
+        response_id="r1",
+        resolution="answer",
+        answer_content="answer",
+    )
+    wrong_kind = store.resolve_question(
+        approval.id,
+        expected_session_id="s1",
+        response_id="r2",
+        resolution="allow",
+        answer_content="allow",
+    )
+
+    assert wrong_session.status == "rejected"
+    assert wrong_kind.status == "rejected"
+    assert store.get(question.id).state != STATE_RESOLVED
+    assert store.get(approval.id).state != STATE_RESOLVED
+
+
+def test_resolve_question_accepts_attachment_only_answer(tmp_path):
+    store = PendingStore(tmp_path / "pending.json")
+    item = store.add_question("s1", "Show me")
+    content = [
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,AA=="},
+        }
+    ]
+
+    result = store.resolve_question(
+        item.id,
+        expected_session_id="s1",
+        response_id="image-response",
+        resolution="[1 image]",
+        answer_content=content,
+    )
+
+    assert result.status == "accepted"
+    assert store.question_answer(item.id)["content"] == content
+
+
+def test_resolve_question_save_failure_does_not_publish_or_wake(tmp_path, monkeypatch):
+    store = PendingStore(tmp_path / "pending.json")
+    item = store.add_question("s1", "Question")
+
+    def fail_save(_items):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store._store, "_save_items", fail_save)
+    with pytest.raises(OSError, match="disk full"):
+        store.resolve_question(
+            item.id,
+            expected_session_id="s1",
+            response_id="r1",
+            resolution="answer",
+            answer_content="answer",
+        )
+
+    assert store.get(item.id).state != STATE_RESOLVED
+    assert item.id not in store._waiters
+
+
+def test_consuming_question_answer_removes_duplicate_attachment_payload(tmp_path):
+    store = PendingStore(tmp_path / "pending.json")
+    item = store.add_question("s1", "Question")
+    content = [
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,AA=="},
+        }
+    ]
+    result = store.resolve_question(
+        item.id,
+        expected_session_id="s1",
+        response_id="r1",
+        resolution="[1 image]",
+        answer_content=content,
+        answer_display={
+            "text": "",
+            "attachments": [
+                {
+                    "kind": "image",
+                    "name": "image.png",
+                    "data_url": "data:image/png;base64,AA==",
+                }
+            ],
+        },
+    )
+
+    assert store.mark_question_answer_consumed(
+        item.id,
+        response_id="r1",
+        response_digest=result.item.data["response_digest"],
+    )
+    saved = store.get(item.id)
+    assert "answer_content" not in saved.data
+    assert "answer_display" not in saved.data
+
+
+def test_grouped_question_answer_cleanup_is_all_or_nothing(tmp_path):
+    store = PendingStore(tmp_path / "pending.json")
+    first = store.add_question("s1", "First")
+    second = store.add_question("s1", "Second")
+    results = [
+        store.resolve_question(
+            item.id,
+            expected_session_id="s1",
+            response_id=f"response-{index}",
+            resolution=answer,
+            answer_content=answer,
+        )
+        for index, (item, answer) in enumerate(
+            ((first, "one"), (second, "two")), start=1
+        )
+    ]
+    entries = [
+        {
+            "item_id": result.item.id,
+            "response_id": result.item.data["response_id"],
+            "response_digest": result.item.data["response_digest"],
+        }
+        for result in results
+    ]
+    conflicting = [dict(entries[0]), {**entries[1], "response_digest": "sha256:bad"}]
+
+    assert store.mark_question_answers_consumed(conflicting) is False
+    assert "answer_content" in store.get(first.id).data
+    assert "answer_content" in store.get(second.id).data
+
+    assert store.mark_question_answers_consumed(entries) is True
+    assert "answer_content" not in store.get(first.id).data
+    assert "answer_content" not in store.get(second.id).data
+
+
 def test_question_options_are_normalized_and_deduplicated(tmp_path):
     store = PendingStore(tmp_path / "pending.json")
     item = store.add_question(
