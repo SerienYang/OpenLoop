@@ -12,6 +12,7 @@ import {
   getSettings,
   getInbox,
   getUnattended,
+  relocateProject,
   resolveInboxItem,
   resolveQuestionItem,
   deleteSession,
@@ -43,7 +44,13 @@ import { addTurnUsage, emptyUsage, usageFromMessages } from "./usage";
 import { streamMode } from "./streamGate";
 import { InboxItemCard } from "./components/InboxItemCard";
 import { useI18n } from "./i18n";
-import { isTauri, platformOS, setAwakeRunning, startWindowDrag } from "./tauri";
+import {
+  chooseFolder,
+  isTauri,
+  platformOS,
+  setAwakeRunning,
+  startWindowDrag,
+} from "./tauri";
 import { Icon } from "./components/Icon";
 import { Sidebar } from "./components/Sidebar";
 import { ThinkingBlock, Transcript } from "./components/Transcript";
@@ -366,6 +373,29 @@ export function App() {
   // until `booting` clears), so an early click can't land on a session that's still settling.
   const [uiReady, setUiReady] = useState(false);
 
+  const resolveSessionWorkspace = async (
+    target: SessionInfo,
+  ): Promise<string | null> => {
+    if (!target.project_id || target.project_path_exists !== false) {
+      return target.project_path || target.workspace || "";
+    }
+    const relocate = window.confirm(
+      t(
+        'The folder for project "{{name}}" is missing. Relocate it before opening this conversation?',
+        { name: target.project_name || target.title || t("Project") },
+      ),
+    );
+    if (!relocate) return null;
+    const picked = await chooseFolder();
+    if (!picked) return null;
+    const result = await relocateProject(target.project_id, picked);
+    if (!result.ok) {
+      window.alert(result.error || t("Could not update the project folder."));
+      return null;
+    }
+    return result.project?.path || picked;
+  };
+
   // On boot, reopen the most recent conversation when one exists.
   const resumeLast = async () => {
     let loadedSessions: SessionInfo[] = [];
@@ -378,10 +408,15 @@ export function App() {
       const ts = (s: SessionInfo) => Date.parse(s.updated_at || "") || Number(s.updated_at) || 0;
       const last = [...sess].sort((a, b) => ts(b) - ts(a))[0];
       if (last) {
+        const resolvedWorkspace = await resolveSessionWorkspace(last);
+        if (resolvedWorkspace === null) {
+          setWorkspace(null);
+          return;
+        }
         setResumedExisting(true);
         setAgent(normalizeAgent(last.agent));
-        if (last.workspace) {
-          setWorkspace(last.workspace);
+        if (resolvedWorkspace) {
+          setWorkspace(resolvedWorkspace);
         }
         try {
           const messages = await getSessionMessages(last.session_id);
@@ -1036,6 +1071,11 @@ export function App() {
 
   const openSessionFromInbox = (sid: string, ws: string, ag: string) => selectSession(sid, ws, ag);
   const selectSession = async (id: string, ws: string, ag: string) => {
+    const target = sessions.find((session) => session.session_id === id);
+    const resolvedWorkspace = target
+      ? await resolveSessionWorkspace(target)
+      : ws;
+    if (resolvedWorkspace === null) return;
     if (id === sessionId && sessionSelectionTarget.current === null) {
       setSurface("session");
       return;
@@ -1061,8 +1101,8 @@ export function App() {
     sessionSelectionTarget.current = null;
     setAgent(normalizeAgent(ag));
     setPendingProjectId(null);
-    if (ws && ws !== workspace) {
-      setWorkspace(ws); // switch project to the session's folder
+    if (resolvedWorkspace && resolvedWorkspace !== workspace) {
+      setWorkspace(resolvedWorkspace); // switch project to the session's folder
     }
     setItems(itemsFromMessages(messages));
     setUsage(usageFromMessages(messages));

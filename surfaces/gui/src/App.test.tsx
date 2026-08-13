@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => {
     getUnattended: vi.fn(),
     resolveInboxItem: vi.fn(),
     resolveQuestionItem: vi.fn(),
+    relocateProject: vi.fn(),
     deleteSession: vi.fn(),
     renameSession: vi.fn(),
     runAutomation: vi.fn(),
@@ -35,13 +36,17 @@ const mocks = vi.hoisted(() => {
       onClose?: () => void;
     };
     closed = false;
+    sessionId: string;
+    workspace: string;
 
     constructor(
-      _sessionId: string,
-      _workspace: string,
+      sessionId: string,
+      workspace: string,
       _agent: string,
       handlers: { onEvent: (event: any) => void; onOpen?: () => void; onClose?: () => void },
     ) {
+      this.sessionId = sessionId;
+      this.workspace = workspace;
       this.handlers = handlers;
       sessionInstances.push(this);
       queueMicrotask(() => {
@@ -77,6 +82,7 @@ const mocks = vi.hoisted(() => {
     platformOS: vi.fn(() => "macos"),
     setAwakeRunning: vi.fn(),
     startWindowDrag: vi.fn(),
+    chooseFolder: vi.fn(),
   };
 
   return { api, sessionInstances, FakeSession, tauri };
@@ -105,24 +111,42 @@ vi.mock("./components/AppFrame", () => ({
 }));
 
 vi.mock("./components/Sidebar", () => ({
-  Sidebar: ({ onNewProjectSession }: any) => (
-    <button
-      type="button"
-      data-testid="new-project-session"
-      onClick={() =>
-        onNewProjectSession({
-          project_id: "project-content",
-          name: "内容策略平台",
-          path: "/workspace/content-strategy",
-          hidden: false,
-          pinned: false,
-          unarchived_sessions: 0,
-          path_exists: true,
-        })
-      }
-    >
-      New project session
-    </button>
+  Sidebar: ({ onNewProjectSession, onSelectSession, sessions }: any) => (
+    <>
+      <button
+        type="button"
+        data-testid="new-project-session"
+        onClick={() =>
+          onNewProjectSession({
+            project_id: "project-content",
+            name: "内容策略平台",
+            path: "/workspace/content-strategy",
+            hidden: false,
+            pinned: false,
+            unarchived_sessions: 0,
+            path_exists: true,
+          })
+        }
+      >
+        New project session
+      </button>
+      {sessions.map((session: any) => (
+        <button
+          key={session.session_id}
+          type="button"
+          data-testid={`select-${session.session_id}`}
+          onClick={() =>
+            onSelectSession(
+              session.session_id,
+              session.workspace,
+              session.agent,
+            )
+          }
+        >
+          {session.title}
+        </button>
+      ))}
+    </>
   ),
 }));
 
@@ -261,6 +285,7 @@ beforeEach(() => {
     item_id: "question-1",
     response_id: "response-fixed",
   });
+  mocks.api.relocateProject.mockResolvedValue({ ok: true });
   mocks.api.deleteSession.mockResolvedValue({ ok: true });
   mocks.api.renameSession.mockResolvedValue({ ok: true });
   mocks.api.runAutomation.mockResolvedValue({ ok: true });
@@ -272,6 +297,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   delete (HTMLElement.prototype as Partial<typeof HTMLElement.prototype>).scrollTo;
 });
 
@@ -338,5 +364,138 @@ describe("App fresh session state", () => {
       ),
     );
     expect(session.respondQuestion).not.toHaveBeenCalled();
+  });
+
+  it("relocates a missing project folder before restoring its session", async () => {
+    mocks.api.getSessions.mockResolvedValue([
+      {
+        session_id: "session-missing",
+        title: "Missing project session",
+        workspace: "/workspace/old",
+        project_id: "project-missing",
+        project_name: "Project",
+        project_path: "/workspace/old",
+        project_path_exists: false,
+        agent: "openloop",
+        model: "gpt-5.6-sol",
+        mode: "interactive",
+        updated_at: "2026-08-13T09:00:00Z",
+        messages: 2,
+      },
+    ]);
+    mocks.tauri.chooseFolder.mockResolvedValue("/workspace/new");
+    mocks.api.relocateProject.mockResolvedValue({
+      ok: true,
+      project: {
+        project_id: "project-missing",
+        name: "Project",
+        path: "/workspace/new",
+        hidden: false,
+        path_exists: true,
+      },
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App />);
+
+    await waitFor(() =>
+      expect(mocks.api.relocateProject).toHaveBeenCalledWith(
+        "project-missing",
+        "/workspace/new",
+      ),
+    );
+    await waitFor(() =>
+      expect(
+        mocks.sessionInstances.some(
+          (session) =>
+            session.sessionId === "session-missing" &&
+            session.workspace === "/workspace/new",
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it("does not restore a missing project session when relocation is declined", async () => {
+    mocks.api.getSessions.mockResolvedValue([
+      {
+        session_id: "session-missing",
+        title: "Missing project session",
+        workspace: "/workspace/old",
+        project_id: "project-missing",
+        project_name: "Project",
+        project_path: "/workspace/old",
+        project_path_exists: false,
+        agent: "openloop",
+        model: "gpt-5.6-sol",
+        mode: "interactive",
+        updated_at: "2026-08-13T09:00:00Z",
+        messages: 2,
+      },
+    ]);
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    render(<App />);
+
+    await waitFor(() => expect(window.confirm).toHaveBeenCalled());
+    expect(mocks.tauri.chooseFolder).not.toHaveBeenCalled();
+    expect(mocks.api.relocateProject).not.toHaveBeenCalled();
+    expect(mocks.api.getSessionMessages).not.toHaveBeenCalledWith("session-missing");
+    expect(
+      mocks.sessionInstances.some(
+        (session) => session.sessionId === "session-missing",
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps the current session when a selected missing project is not relocated", async () => {
+    mocks.api.getSessions.mockResolvedValue([
+      {
+        session_id: "session-current",
+        title: "Current session",
+        workspace: "/workspace/current",
+        agent: "openloop",
+        model: "gpt-5.6-sol",
+        mode: "interactive",
+        updated_at: "2026-08-13T10:00:00Z",
+        messages: 2,
+      },
+      {
+        session_id: "session-missing",
+        title: "Missing project session",
+        workspace: "/workspace/old",
+        project_id: "project-missing",
+        project_name: "Project",
+        project_path: "/workspace/old",
+        project_path_exists: false,
+        agent: "openloop",
+        model: "gpt-5.6-sol",
+        mode: "interactive",
+        updated_at: "2026-08-13T09:00:00Z",
+        messages: 2,
+      },
+    ]);
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+    render(<App />);
+    await waitFor(() =>
+      expect(
+        mocks.sessionInstances.some(
+          (session) => session.sessionId === "session-current",
+        ),
+      ).toBe(true),
+    );
+    const currentSession = mocks.sessionInstances.find(
+      (session) => session.sessionId === "session-current",
+    )!;
+
+    fireEvent.click(await screen.findByTestId("select-session-missing"));
+
+    await waitFor(() => expect(window.confirm).toHaveBeenCalled());
+    expect(currentSession.closed).toBe(false);
+    expect(mocks.api.getSessionMessages).not.toHaveBeenCalledWith("session-missing");
+    expect(
+      mocks.sessionInstances.some(
+        (session) => session.sessionId === "session-missing",
+      ),
+    ).toBe(false);
   });
 });

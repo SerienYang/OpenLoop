@@ -9,6 +9,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from openloop.automation import Schedule, ScheduledTask
 from openloop.providers import (
     AssistantTurn,
     ModelCapabilities,
@@ -710,6 +711,18 @@ def test_project_relocate_updates_path_without_renaming_project(tmp_path):
     new_dir.mkdir()
     project = manager.create_project("Display Name", str(old_dir))["project"]
     pid = project["project_id"]
+    for session_id in ("project-a", "project-b"):
+        manager.session_store.save(
+            SessionRecord(
+                session_id=session_id,
+                workspace=str(old_dir),
+                model="m",
+                mode="interactive",
+                messages=[],
+                project_id=pid,
+                workspace_kind="project",
+            )
+        )
     client = TestClient(create_app(manager))
 
     moved = client.patch(f"/v1/projects/{pid}", json={"path": str(new_dir)}).json()
@@ -718,6 +731,302 @@ def test_project_relocate_updates_path_without_renaming_project(tmp_path):
     assert moved["project"]["name"] == "Display Name"
     assert moved["project"]["path"] == str(new_dir.resolve())
     assert moved["project"]["path_exists"] is True
+    for session_id in ("project-a", "project-b"):
+        record = manager.session_store.load(session_id)
+        assert record.workspace == str(new_dir.resolve())
+        assert record.workspace_kind == "project"
+        assert record.managed_root is None
+
+
+def test_project_relocation_collision_restores_scheduled_task_workspace(tmp_path):
+    manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    old_dir = tmp_path / "old"
+    occupied_dir = tmp_path / "occupied"
+    old_dir.mkdir()
+    occupied_dir.mkdir()
+    project = manager.create_project("Project", str(old_dir))["project"]
+    manager.create_project("Occupied", str(occupied_dir))
+    task = ScheduledTask(
+        title="Task",
+        instructions="Do work",
+        schedule=Schedule(kind="cron", cron="0 9 * * *"),
+        workspace=str(old_dir),
+    )
+    manager.task_store.save(task)
+
+    result = manager.update_project(
+        project["project_id"], path=str(occupied_dir)
+    )
+
+    assert result["ok"] is False
+    assert manager.session_store.get_project(project["project_id"])["path"] == str(
+        old_dir.resolve()
+    )
+    assert manager.task_store.get(task.id).workspace == str(old_dir.resolve())
+
+    stale_task = manager.task_store.get(task.id)
+    stale_task.workspace = str(occupied_dir)
+    token = manager.begin_scheduled_project_preparation("run", stale_task)
+
+    assert token is not None
+    assert stale_task.workspace == str(old_dir.resolve())
+    assert manager._project_preparations[token][1] == project["project_id"]
+    manager.end_project_session_preparation(token)
+
+
+def test_set_session_project_syncs_workspace_metadata(tmp_path):
+    manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    project = manager.create_project("Project", str(project_dir))["project"]
+    managed_root = tmp_path / "managed"
+    managed_root.mkdir()
+    managed_workspace = managed_root / "plain"
+    managed_workspace.mkdir()
+    manager.session_store.save(
+        SessionRecord(
+            session_id="plain",
+            workspace=str(managed_workspace),
+            model="m",
+            mode="interactive",
+            messages=[],
+            workspace_kind="managed",
+            managed_root=str(managed_root),
+        )
+    )
+
+    result = manager.set_session_project("plain", project["project_id"])
+
+    assert result["ok"] is True
+    record = manager.session_store.load("plain")
+    assert record.project_id == project["project_id"]
+    assert record.workspace == str(project_dir.resolve())
+    assert record.workspace_kind == "project"
+    assert record.managed_root is None
+
+
+def test_project_sessions_use_current_project_path_for_runtime_and_api(tmp_path):
+    manager = SessionManager(workspace=None, data_dir=tmp_path / "data")
+    stale_dir = tmp_path / "stale"
+    project_dir = tmp_path / "current"
+    stale_dir.mkdir()
+    project_dir.mkdir()
+    project = manager.create_project("Project", str(project_dir))["project"]
+    manager.session_store.save(
+        SessionRecord(
+            session_id="legacy",
+            workspace=str(stale_dir),
+            model="m",
+            mode="interactive",
+            messages=[],
+            project_id=project["project_id"],
+            workspace_kind="project",
+        )
+    )
+
+    row = next(s for s in manager.list_sessions() if s["session_id"] == "legacy")
+
+    assert row["workspace"] == str(project_dir.resolve())
+    assert row["project_name"] == "Project"
+    assert row["project_path"] == str(project_dir.resolve())
+    assert row["project_path_exists"] is True
+    assert manager.engine_workspace("legacy") == str(project_dir.resolve())
+    engine = manager.get_engine("legacy")
+    assert engine is not None
+    assert str(engine.executor.cwd) == str(project_dir.resolve())
+    manager.save("legacy", engine)
+    saved = manager.session_store.load("legacy")
+    assert saved.workspace_kind == "project"
+    assert saved.managed_root is None
+
+    (project_dir / "result.md").write_text("result", encoding="utf-8")
+    assert [item["path"] for item in manager.list_artifacts("legacy")] == [
+        "result.md"
+    ]
+    assert manager.get_roots("legacy")[0]["path"] == str(project_dir.resolve())
+
+
+def test_missing_project_session_does_not_fall_back_to_managed_workspace(tmp_path):
+    manager = SessionManager(workspace=None, data_dir=tmp_path / "data")
+    session_root = tmp_path / "sessions"
+    manager.set_session_root(str(session_root))
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    project = manager.create_project("Project", str(project_dir))["project"]
+    manager.session_store.save(
+        SessionRecord(
+            session_id="missing",
+            workspace=str(project_dir),
+            model="m",
+            mode="interactive",
+            messages=[],
+            project_id=project["project_id"],
+            workspace_kind="project",
+        )
+    )
+    project_dir.rmdir()
+
+    row = next(s for s in manager.list_sessions() if s["session_id"] == "missing")
+
+    assert row["project_path_exists"] is False
+    assert manager.get_engine("missing") is None
+    assert not list(session_root.glob("*missing"))
+
+
+def test_project_by_path_returns_existing_hidden_project_without_reopening(tmp_path):
+    manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    project = manager.create_project("Project", str(project_dir))["project"]
+    manager.update_project(project["project_id"], hidden=True)
+    client = TestClient(create_app(manager))
+
+    found = client.get(
+        "/v1/projects/by-path", params={"path": str(project_dir)}
+    ).json()
+    missing = client.get(
+        "/v1/projects/by-path", params={"path": str(tmp_path / "unknown")}
+    ).json()
+
+    assert found["ok"] is True
+    assert found["project"]["project_id"] == project["project_id"]
+    assert found["project"]["hidden"] is True
+    assert missing == {"ok": True, "project": None}
+
+
+def test_project_relocation_waits_for_session_clients_then_evicts_idle_engine(
+    tmp_path,
+):
+    manager = SessionManager(workspace=None, data_dir=tmp_path / "data")
+    old_dir = tmp_path / "old"
+    new_dir = tmp_path / "new"
+    old_dir.mkdir()
+    new_dir.mkdir()
+    project = manager.create_project("Project", str(old_dir))["project"]
+    manager.session_store.save(
+        SessionRecord(
+            session_id="project-session",
+            workspace=str(old_dir),
+            model="m",
+            mode="interactive",
+            messages=[],
+            project_id=project["project_id"],
+            workspace_kind="project",
+        )
+    )
+    old_engine = manager.get_engine("project-session")
+    assert old_engine is not None
+    send = lambda _message: None
+    manager.register_session_client("project-session", send)
+
+    blocked = manager.update_project(project["project_id"], path=str(new_dir))
+
+    assert blocked["ok"] is False
+    assert manager.session_store.get_project(project["project_id"])["path"] == str(
+        old_dir.resolve()
+    )
+
+    manager.unregister_session_client("project-session", send)
+    moved = manager.update_project(project["project_id"], path=str(new_dir))
+
+    assert moved["ok"] is True
+    assert "project-session" not in manager._engines
+    manager.save("project-session", old_engine)
+    assert manager.session_store.load("project-session").workspace == str(
+        new_dir.resolve()
+    )
+
+
+def test_project_relocation_detects_unpersisted_project_session(tmp_path):
+    manager = SessionManager(workspace=None, data_dir=tmp_path / "data")
+    old_dir = tmp_path / "old"
+    new_dir = tmp_path / "new"
+    old_dir.mkdir()
+    new_dir.mkdir()
+    project = manager.create_project("Project", str(old_dir))["project"]
+    engine = manager.get_engine("fresh", project_id=project["project_id"])
+    assert engine is not None
+    send = lambda _message: None
+    manager.register_session_client("fresh", send)
+
+    blocked = manager.update_project(project["project_id"], path=str(new_dir))
+
+    assert blocked["ok"] is False
+    assert manager.session_store.get_project(project["project_id"])["path"] == str(
+        old_dir.resolve()
+    )
+
+
+def test_project_relocation_waits_for_all_preparation_tokens(tmp_path):
+    manager = SessionManager(workspace=None, data_dir=tmp_path / "data")
+    old_dir = tmp_path / "old"
+    new_dir = tmp_path / "new"
+    old_dir.mkdir()
+    new_dir.mkdir()
+    project = manager.create_project("Project", str(old_dir))["project"]
+    first = manager.begin_project_session_preparation(
+        "fresh", project["project_id"]
+    )
+    second = manager.begin_project_session_preparation(
+        "fresh", project["project_id"]
+    )
+
+    manager.end_project_session_preparation(first)
+    still_blocked = manager.update_project(
+        project["project_id"], path=str(new_dir)
+    )
+
+    assert still_blocked["ok"] is False
+
+    manager.end_project_session_preparation(second)
+    moved = manager.update_project(project["project_id"], path=str(new_dir))
+
+    assert moved["ok"] is True
+
+
+def test_project_path_is_used_for_pending_and_session_skills(tmp_path, monkeypatch):
+    manager = SessionManager(workspace=None, data_dir=tmp_path / "data")
+    stale_dir = tmp_path / "stale"
+    project_dir = tmp_path / "current"
+    stale_dir.mkdir()
+    project_dir.mkdir()
+    project = manager.create_project("Project", str(project_dir))["project"]
+    manager.session_store.save(
+        SessionRecord(
+            session_id="legacy",
+            workspace=str(stale_dir),
+            model="m",
+            mode="interactive",
+            messages=[],
+            project_id=project["project_id"],
+            workspace_kind="project",
+        )
+    )
+    manager.pending.add_approval("legacy", "Approve?")
+    seen_workspaces = []
+
+    def fake_skills(session_id, workspace):
+        seen_workspaces.append((session_id, workspace))
+        return {"skills": []}
+
+    monkeypatch.setattr(manager, "session_skills_view", fake_skills)
+    client = TestClient(create_app(manager))
+
+    pending = client.get("/v1/pending", params={"session_id": "legacy"}).json()
+    client.get(
+        "/v1/sessions/legacy/skills",
+        params={"workspace": str(stale_dir)},
+    )
+    client.post(
+        "/v1/sessions/legacy/skills",
+        json={"skill": "test", "enabled": True, "workspace": str(stale_dir)},
+    )
+
+    assert pending["items"][0]["session_workspace"] == str(project_dir.resolve())
+    assert seen_workspaces == [
+        ("legacy", str(project_dir.resolve())),
+        ("legacy", str(project_dir.resolve())),
+    ]
 
 
 def test_archived_sessions_include_project_recovery_context(tmp_path):

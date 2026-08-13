@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -172,6 +173,8 @@ class SessionManager:
         self._running_sessions: set[str] = (
             set()
         )  # sessions with an in-flight turn (busy)
+        self._project_workspace_lock = threading.RLock()
+        self._project_preparations: dict[str, tuple[str, str]] = {}
         # Sessions with an auto-title LLM call in flight (FB-010) — one call at a time.
         self._autotitle_inflight: set[str] = set()
         self._autotitle_tasks: set[asyncio.Task] = set()
@@ -386,6 +389,11 @@ class SessionManager:
     def list_projects(self, *, include_hidden: bool = False) -> list[dict[str, Any]]:
         return self.session_store.list_projects(include_hidden=include_hidden)
 
+    def project_by_path(self, path: str) -> dict[str, Any]:
+        if not str(path or "").strip():
+            return {"ok": False, "error": "project path is required"}
+        return {"ok": True, "project": self.session_store.project_by_path(path)}
+
     def update_project(
         self,
         project_id: str,
@@ -400,14 +408,69 @@ class SessionManager:
             next_path = Path(str(path or "")).expanduser()
             if not next_path.is_dir():
                 return {"ok": False, "error": "folder does not exist"}
-        ok = self.session_store.update_project(
-            project_id,
-            name=name,
-            description=description,
-            pinned=pinned,
-            hidden=hidden,
-            path=path,
-        )
+        with self._project_workspace_lock:
+            project_before = self.session_store.get_project(project_id)
+            changed_task_ids: list[str] = []
+            old_path = str(project_before["path"]) if project_before else ""
+            new_path = (
+                str(next_path.resolve())
+                if path is not None and next_path.is_dir()
+                else old_path
+            )
+            if path is not None:
+                session_ids = set(
+                    self.session_store.session_ids_for_project(project_id)
+                )
+                session_ids.update(
+                    session_id
+                    for session_id, engine in self._engines.items()
+                    if getattr(engine, "_project_id", None) == project_id
+                )
+                preparing = any(
+                    pending_project_id == project_id
+                    for _session_id, pending_project_id in (
+                        self._project_preparations.values()
+                    )
+                )
+                if preparing or any(
+                    session_id in self._running_sessions
+                    or bool(self._session_clients.get(session_id))
+                    for session_id in session_ids
+                ):
+                    return {
+                        "ok": False,
+                        "error": (
+                            "project sessions are active; close them before relocating "
+                            "the folder"
+                        ),
+                    }
+                if old_path and old_path != new_path:
+                    try:
+                        changed_task_ids = self.task_store.relocate_workspace(
+                            old_path, new_path
+                        )
+                    except Exception:
+                        return {
+                            "ok": False,
+                            "error": "could not update scheduled task workspaces",
+                        }
+            try:
+                ok = self.session_store.update_project(
+                    project_id,
+                    name=name,
+                    description=description,
+                    pinned=pinned,
+                    hidden=hidden,
+                    path=path,
+                )
+            except Exception:
+                self.task_store.set_task_workspaces(changed_task_ids, old_path)
+                raise
+            if not ok:
+                self.task_store.set_task_workspaces(changed_task_ids, old_path)
+            elif path is not None:
+                for session_id in session_ids:
+                    self._engines.pop(session_id, None)
         if not ok:
             return {"ok": False, "error": "project not found or nothing to update"}
         return {"ok": True, "project": self.session_store.get_project(project_id)}
@@ -420,9 +483,33 @@ class SessionManager:
         self, session_id: str, project_id: Optional[str]
     ) -> dict[str, Any]:
         """Bind a session to a project (or None to unbind it back to a plain session)."""
-        if project_id is not None and self.session_store.get_project(project_id) is None:
-            return {"ok": False, "error": "project not found"}
-        ok = self.session_store.set_session_project(session_id, project_id)
+        with self._project_workspace_lock:
+            preparing = any(
+                pending_session_id == session_id
+                for pending_session_id, _project_id in (
+                    self._project_preparations.values()
+                )
+            )
+            if (
+                preparing
+                or session_id in self._running_sessions
+                or self._session_clients.get(session_id)
+            ):
+                return {
+                    "ok": False,
+                    "error": "session is active; close it before changing its project",
+                }
+            project = (
+                self.session_store.get_project(project_id) if project_id else None
+            )
+            if project_id is not None and project is None:
+                return {"ok": False, "error": "project not found"}
+            self._engines.pop(session_id, None)
+            ok = self.session_store.set_session_project(
+                session_id,
+                project_id,
+                project_path=str(project["path"]) if project else None,
+            )
         return {"ok": ok, "error": None if ok else "session not found"}
 
     def project_workspace(self, project_id: Optional[str]) -> Optional[str]:
@@ -472,6 +559,68 @@ class SessionManager:
         return self.default_workspace
 
     # -- engines ----------------------------------------------------------------
+    def begin_project_session_preparation(
+        self, session_id: str, project_id: Optional[str]
+    ) -> Optional[str]:
+        with self._project_workspace_lock:
+            record = self.session_store.load(session_id)
+            effective_project_id = (
+                record.project_id if record and record.project_id else project_id
+            )
+            if not effective_project_id:
+                return None
+            token = uuid.uuid4().hex
+            self._project_preparations[token] = (
+                session_id,
+                effective_project_id,
+            )
+            return token
+
+    def begin_scheduled_project_preparation(
+        self, session_id: str, task: ScheduledTask
+    ) -> Optional[str]:
+        with self._project_workspace_lock:
+            authoritative = self.task_store.get(task.id)
+            if authoritative is not None:
+                task.workspace = authoritative.workspace
+            workspace = os.path.realpath(
+                os.path.expanduser(str(task.workspace or ""))
+            )
+            project = self.session_store.project_by_path(workspace)
+            if project is None:
+                return None
+            task.workspace = str(project["path"])
+            token = uuid.uuid4().hex
+            self._project_preparations[token] = (
+                session_id,
+                project["project_id"],
+            )
+            return token
+
+    def end_project_session_preparation(self, token: Optional[str]) -> None:
+        if not token:
+            return
+        with self._project_workspace_lock:
+            self._project_preparations.pop(token, None)
+
+    def _effective_session_workspace(
+        self, record: Optional[SessionRecord]
+    ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+        if record is None:
+            return self.default_workspace, None
+        if record.project_id:
+            project = self.session_store.get_project(record.project_id)
+            return (
+                (str(project.get("path") or "") or None) if project else None,
+                project,
+            )
+        return record.workspace or None, None
+
+    def session_workspace(self, session_id: str) -> Optional[str]:
+        record = self.session_store.load(session_id)
+        workspace, _project = self._effective_session_workspace(record)
+        return workspace
+
     def engine_workspace(
         self,
         session_id: str,
@@ -482,11 +631,38 @@ class SessionManager:
         """The workspace `get_engine` would bind — for prepping MCP tools beforehand."""
         record = self.session_store.load(session_id)
         if record:
-            return record.workspace or None
+            effective, _project = self._effective_session_workspace(record)
+            return self.resolve_workspace(effective) if effective else None
         ag = get_agent(agent or "openloop")
         return self.resolve_workspace(workspace) if ag.needs_workspace else None
 
     def get_engine(
+        self,
+        session_id: str,
+        *,
+        workspace: Optional[str] = None,
+        project_id: Optional[str] = None,
+        agent: str = "openloop",
+        approver: Optional[Approver] = None,
+        extra_tools: Optional[list[Any]] = None,
+        directory_requester: Optional[Any] = None,
+        plan_approver: Optional[Any] = None,
+        question_asker: Optional[Any] = None,
+    ) -> Optional[TurnEngine]:
+        with self._project_workspace_lock:
+            return self._get_engine_unlocked(
+                session_id,
+                workspace=workspace,
+                project_id=project_id,
+                agent=agent,
+                approver=approver,
+                extra_tools=extra_tools,
+                directory_requester=directory_requester,
+                plan_approver=plan_approver,
+                question_asker=question_asker,
+            )
+
+    def _get_engine_unlocked(
         self,
         session_id: str,
         *,
@@ -515,8 +691,12 @@ class SessionManager:
         agent_name = (record.agent if record else agent) or "openloop"
         ag = get_agent(agent_name)
 
+        effective_project_id = record.project_id if record else project_id
         if record:
-            ws = record.workspace or None
+            effective_workspace, project = self._effective_session_workspace(record)
+            if record.project_id and project is None:
+                return None
+            ws = self.resolve_workspace(effective_workspace)
             model, mode, messages = record.model, Mode(record.mode), record.messages
         else:
             project = self.session_store.get_project(project_id) if project_id else None
@@ -532,7 +712,7 @@ class SessionManager:
             model, mode, messages = self.model, self.mode, None
 
         if ag.needs_workspace and (not ws or not Path(ws).is_dir()):
-            if project_id:
+            if effective_project_id:
                 return None
             # OpenLoop sessions without a selected project use a managed scratch directory.
             if ag.family == "knowledge":
@@ -613,8 +793,8 @@ class SessionManager:
             engine.compaction_state = CompactionState.from_dict(record.compaction)
         engine.compaction_settings = self.compaction_settings
         self._engines[session_id] = engine
-        if project_id:
-            setattr(engine, "_project_id", project_id)
+        if effective_project_id:
+            setattr(engine, "_project_id", effective_project_id)
         return engine
 
     def _routing_targets(self, session_id: str, agent: str) -> list[str]:
@@ -1345,7 +1525,7 @@ class SessionManager:
 
     def list_artifacts(self, session_id: str) -> list[dict[str, Any]]:
         record = self.session_store.load(session_id)
-        workspace = record.workspace if record else self.default_workspace
+        workspace, _project = self._effective_session_workspace(record)
         if not workspace:
             return []
         root = Path(workspace).expanduser().resolve()
@@ -1425,7 +1605,7 @@ class SessionManager:
     ) -> tuple[Optional[Path], Optional[str]]:
         """Resolve an artifact path under the session's workspace, or (None, error)."""
         record = self.session_store.load(session_id)
-        workspace = record.workspace if record else self.default_workspace
+        workspace, _project = self._effective_session_workspace(record)
         if not workspace:
             return None, "no workspace"
         root = Path(workspace).expanduser().resolve()
@@ -2817,14 +2997,16 @@ class SessionManager:
                 self.unregister_event_client(cb)
 
     def register_session_client(self, session_id: str, send_cb: Any) -> None:
-        self._session_clients.setdefault(session_id, set()).add(send_cb)
+        with self._project_workspace_lock:
+            self._session_clients.setdefault(session_id, set()).add(send_cb)
 
     def unregister_session_client(self, session_id: str, send_cb: Any) -> None:
-        clients = self._session_clients.get(session_id)
-        if clients is not None:
-            clients.discard(send_cb)
-            if not clients:
-                self._session_clients.pop(session_id, None)
+        with self._project_workspace_lock:
+            clients = self._session_clients.get(session_id)
+            if clients is not None:
+                clients.discard(send_cb)
+                if not clients:
+                    self._session_clients.pop(session_id, None)
 
     async def broadcast_session(self, session_id: str, message: dict) -> None:
         """Fan a turn event out to every socket viewing this session. Best-effort: a dead socket
@@ -3011,6 +3193,9 @@ class SessionManager:
             ),
         )
         self._seed_task_permissions(engine, task)
+        project = self.session_store.project_by_path(task.workspace)
+        if project:
+            setattr(engine, "_project_id", project["project_id"])
         return engine
 
     # -- mirroring inbox items to a bound channel -------------------------------
@@ -3194,24 +3379,28 @@ class SessionManager:
         return resumed
 
     def mark_running(self, session_id: str) -> None:
-        self._running_sessions.add(session_id)
+        with self._project_workspace_lock:
+            self._running_sessions.add(session_id)
 
     def try_mark_running(self, session_id: str) -> bool:
         """Atomically claim an idle session for one turn on the server event loop."""
-        if session_id in self._running_sessions:
-            return False
-        self._running_sessions.add(session_id)
-        return True
+        with self._project_workspace_lock:
+            if session_id in self._running_sessions:
+                return False
+            self._running_sessions.add(session_id)
+            return True
 
     def mark_idle(self, session_id: str) -> None:
-        self._running_sessions.discard(session_id)
+        with self._project_workspace_lock:
+            self._running_sessions.discard(session_id)
         # Every turn path (WS, background delivery, durable resume) marks idle when it
         # finishes — the one shared post-turn moment, so auto-titling hooks in here and
         # can never add latency to the response itself.
         self._maybe_autotitle(session_id)
 
     def is_running(self, session_id: str) -> bool:
-        return session_id in self._running_sessions
+        with self._project_workspace_lock:
+            return session_id in self._running_sessions
 
     def running_state(self) -> dict[str, Any]:
         return {
@@ -3240,12 +3429,14 @@ class SessionManager:
         sidecar for connector messages (framed `message` stays the model-facing text). Returns
         False only when the turn failed or its updated session could not be saved.
         """
-        engine = self.get_engine(session_id)
-        if engine is None:
-            return True
-        if not self.try_mark_running(session_id):
-            engine.queue_steering(message, source)
-            return True
+        with self._project_workspace_lock:
+            engine = self._get_engine_unlocked(session_id)
+            if engine is None:
+                return True
+            if session_id in self._running_sessions:
+                engine.queue_steering(message, source)
+                return True
+            self._running_sessions.add(session_id)
         await self.broadcast_running_state()
         failed = False
         try:
@@ -3471,6 +3662,9 @@ class SessionManager:
         run = TaskRun(
             task_id=task.id, trigger=trigger
         )  # __post_init__ sets run.session_id
+        preparation_token = self.begin_scheduled_project_preparation(
+            run.session_id, task
+        )
         self.task_store.add_run(run)  # mark "running"
         self.mark_running(run.session_id)
         await self.broadcast_running_state()
@@ -3493,10 +3687,17 @@ class SessionManager:
         # Each run is a real, persisted conversation thread: it runs the instructions under its
         # own session id, then saves the transcript. The user can reopen that session and ask a
         # follow-up — the scheduled agent is no longer fire-and-forget.
-        engine = self._build_task_engine(task, session_id=run.session_id)
-        # Register the live engine up-front: a parked approval persists the session
-        # mid-run (durable suspend), and resolving from the Inbox must find this engine.
-        self._engines[run.session_id] = engine
+        try:
+            engine = self._build_task_engine(task, session_id=run.session_id)
+            # Register the live engine up-front: a parked approval persists the session
+            # mid-run (durable suspend), and resolving from the Inbox must find this engine.
+            with self._project_workspace_lock:
+                self._engines[run.session_id] = engine
+        except Exception:
+            self.mark_idle(run.session_id)
+            raise
+        finally:
+            self.end_project_session_preparation(preparation_token)
         # The first turn is the task itself. The framing matters: instructions often restate the
         # schedule ("every day at 5:32pm…"), so make explicit that the schedule already fired and
         # the job now is to execute, not to (re)schedule.
@@ -3517,8 +3718,6 @@ class SessionManager:
         except Exception as exc:
             run.status, run.error = "error", str(exc)
         finally:
-            self.mark_idle(run.session_id)
-            await self.broadcast_running_state()
             run.finished_at = _epoch()
             # Persist the run as a continuable session + keep the live engine for an immediate
             # follow-up; record the run (now carrying its session_id).
@@ -3527,6 +3726,9 @@ class SessionManager:
                 self._engines[run.session_id] = engine
             except Exception:
                 pass
+            finally:
+                self.mark_idle(run.session_id)
+            await self.broadcast_running_state()
             self.task_store.add_run(run)
         return run
 
@@ -3731,14 +3933,22 @@ class SessionManager:
         return {"ok": True, "run": run.to_dict()}
 
     def save(self, session_id: str, engine: TurnEngine) -> None:
+        with self._project_workspace_lock:
+            self._save_unlocked(session_id, engine)
+
+    def _save_unlocked(self, session_id: str, engine: TurnEngine) -> None:
         executor = getattr(engine, "executor", None)
         workspace = os.path.realpath(str(executor.cwd)) if executor else ""
         # Auto-bind to a first-class project when the session's workspace matches one.
         # Explicit bindings (set via the API) are preserved: ConversationStore.save keeps an
         # existing project_id via COALESCE, and None here never overwrites it.
         project_id = getattr(engine, "_project_id", None)
-        if project_id and self.session_store.get_project(project_id) is None:
-            project_id = None
+        if project_id:
+            project = self.session_store.get_project(project_id)
+            if project is None:
+                project_id = None
+            else:
+                workspace = str(project["path"])
         if workspace:
             if not project_id:
                 proj = self.session_store.project_by_path(workspace)
@@ -3746,7 +3956,9 @@ class SessionManager:
                     project_id = proj["project_id"]
         workspace_kind = None
         managed_root = None
-        if workspace and not project_id:
+        if project_id:
+            workspace_kind = "project"
+        elif workspace:
             try:
                 ws_path = Path(workspace).resolve()
                 root_path = self.session_root().resolve()
@@ -3942,9 +4154,10 @@ class SessionManager:
                 for i, r in enumerate(engine.roots)
             ]
         record = self.session_store.load(session_id)
+        effective_workspace, _project = self._effective_session_workspace(record)
         primary = (
-            record.workspace
-            if record and record.workspace
+            effective_workspace
+            if effective_workspace
             else self._provision_scratch(session_id)
         )
         extra = (record.extra_roots if record else []) or []
@@ -4160,42 +4373,61 @@ class SessionManager:
     # -- read models ------------------------------------------------------------
     def list_sessions(self, workspace: Optional[str] = None) -> list[dict[str, Any]]:
         ws = self.resolve_workspace(workspace) if workspace else None
-        hidden_project_ids = {
-            p["project_id"]
+        if workspace and ws is None:
+            return []
+        projects = {
+            p["project_id"]: p
             for p in self.session_store.list_projects(include_hidden=True)
-            if p.get("hidden")
         }
-        return [
-            {
-                "session_id": r.session_id,
-                "title": r.title or "New session",
-                "workspace": r.workspace,
-                "project_id": r.project_id,
-                "agent": r.agent,
-                "model": r.model,
-                "mode": r.mode,
-                "updated_at": r.updated_at,
-                "messages": r.message_count,
-                "pinned": r.pinned,
-                "archived": r.archived,
-                # §31: non-user origin ("slack") + display label — drives the sidebar's
-                # "From Slack" group and the row's platform icon.
-                "origin": r.origin,
-                "origin_label": r.origin_label,
-                # Attention = Pending items awaiting this session. Liveness = working /
-                # sleeping (a self-wake is pending) / idle — a count-less dot that never bubbles.
-                "attention": len(self.inbox.pending(session_id=r.session_id)),
-                "liveness": self._session_liveness(r.session_id),
-                # Channels this session listens to (inbound subscriptions) — drives the per-session
-                # "connections" indicator.
-                "subscriptions": [
-                    s.channel for s in self.subscriptions.for_session(r.session_id)
-                ],
-            }
-            for r in self.session_store.list(workspace=ws)
-            if not r.session_id.startswith("__")  # hide internal threads
-            and (not r.project_id or r.project_id not in hidden_project_ids)
-        ]
+        out: list[dict[str, Any]] = []
+        for record in self.session_store.list():
+            if record.session_id.startswith("__"):
+                continue
+            project = projects.get(record.project_id) if record.project_id else None
+            if project and project.get("hidden"):
+                continue
+            effective_workspace = (
+                str(project.get("path") or "") if project else record.workspace
+            )
+            if ws is not None and effective_workspace != ws:
+                continue
+            out.append(
+                {
+                    "session_id": record.session_id,
+                    "title": record.title or "New session",
+                    "workspace": effective_workspace,
+                    "project_id": record.project_id,
+                    "project_name": project.get("name") if project else None,
+                    "project_path": project.get("path") if project else None,
+                    "project_path_exists": (
+                        project.get("path_exists") if project else None
+                    ),
+                    "agent": record.agent,
+                    "model": record.model,
+                    "mode": record.mode,
+                    "updated_at": record.updated_at,
+                    "messages": record.message_count,
+                    "pinned": record.pinned,
+                    "archived": record.archived,
+                    # §31: non-user origin ("slack") + display label — drives the sidebar's
+                    # "From Slack" group and the row's platform icon.
+                    "origin": record.origin,
+                    "origin_label": record.origin_label,
+                    # Attention = Pending items awaiting this session. Liveness = working /
+                    # sleeping (a self-wake is pending) / idle — a count-less dot that never bubbles.
+                    "attention": len(
+                        self.inbox.pending(session_id=record.session_id)
+                    ),
+                    "liveness": self._session_liveness(record.session_id),
+                    # Channels this session listens to (inbound subscriptions) — drives the per-session
+                    # "connections" indicator.
+                    "subscriptions": [
+                        s.channel
+                        for s in self.subscriptions.for_session(record.session_id)
+                    ],
+                }
+            )
+        return out
 
     def _session_liveness(self, session_id: str) -> str:
         if self.is_running(session_id):

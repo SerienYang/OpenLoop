@@ -88,6 +88,25 @@ def test_store_crud_and_due(tmp_path):
     assert store.delete(t.id) is True and store.get(t.id) is None
 
 
+def test_store_relocates_task_workspaces_without_changing_schedule_metadata(tmp_path):
+    store = TaskStore(tmp_path / "auto.db")
+    old_dir = tmp_path / "old"
+    new_dir = tmp_path / "new"
+    old_dir.mkdir()
+    new_dir.mkdir()
+    task = store.save(_task(workspace=str(old_dir)))
+    updated_at = task.updated_at
+    next_run = task.next_run
+
+    changed = store.relocate_workspace(str(old_dir), str(new_dir))
+
+    relocated = store.get(task.id)
+    assert changed == [task.id]
+    assert relocated.workspace == str(new_dir.resolve())
+    assert relocated.updated_at == updated_at
+    assert relocated.next_run == next_run
+
+
 def test_store_runs_history(tmp_path):
     store = TaskStore(tmp_path / "auto.db")
     t = _task()
@@ -253,6 +272,79 @@ async def test_scheduled_run_persists_continuable_session(tmp_path, monkeypatch)
     async for _ in engine.run("tell me more"):
         pass
     assert _last_assistant_text(engine.messages) == "Sure — here is more detail."
+
+
+async def test_scheduled_project_run_blocks_relocation_during_engine_build(
+    tmp_path, monkeypatch
+):
+    from openloop.providers import AssistantTurn, ModelCapabilities, ProviderClient
+    from openloop.server.manager import SessionManager
+
+    class ScriptedProvider(ProviderClient):
+        def complete(self, *, model, messages, tools=None, **settings):
+            return AssistantTurn(text="done", finish_reason="stop")
+
+        def capabilities(self, model):
+            return ModelCapabilities()
+
+    old_dir = tmp_path / "old"
+    new_dir = tmp_path / "new"
+    old_dir.mkdir()
+    new_dir.mkdir()
+    manager = SessionManager(data_dir=tmp_path / "data", provider=ScriptedProvider())
+    project = manager.create_project("Project", str(old_dir))["project"]
+    task = _task(workspace=str(old_dir), agent="openloop")
+    original_build = manager._build_task_engine
+    attempts = []
+
+    def build_with_relocation_attempt(task, *, session_id):
+        attempts.append(
+            manager.update_project(project["project_id"], path=str(new_dir))
+        )
+        return original_build(task, session_id=session_id)
+
+    monkeypatch.setattr(manager, "_build_task_engine", build_with_relocation_attempt)
+
+    run = await manager._run_scheduled_task(task, trigger="schedule")
+
+    assert run.status == "ok"
+    assert attempts[0]["ok"] is False
+    record = manager.session_store.load(run.session_id)
+    assert record.project_id == project["project_id"]
+    assert record.workspace == str(old_dir.resolve())
+
+
+async def test_scheduled_project_run_follows_a_relocated_project_with_stale_task(
+    tmp_path,
+):
+    from openloop.providers import AssistantTurn, ModelCapabilities, ProviderClient
+    from openloop.server.manager import SessionManager
+
+    class ScriptedProvider(ProviderClient):
+        def complete(self, *, model, messages, tools=None, **settings):
+            return AssistantTurn(text="done", finish_reason="stop")
+
+        def capabilities(self, model):
+            return ModelCapabilities()
+
+    old_dir = tmp_path / "old"
+    new_dir = tmp_path / "new"
+    old_dir.mkdir()
+    new_dir.mkdir()
+    manager = SessionManager(data_dir=tmp_path / "data", provider=ScriptedProvider())
+    project = manager.create_project("Project", str(old_dir))["project"]
+    stale_task = _task(workspace=str(old_dir), agent="openloop")
+    manager.task_store.save(stale_task)
+
+    moved = manager.update_project(project["project_id"], path=str(new_dir))
+    run = await manager._run_scheduled_task(stale_task, trigger="schedule")
+
+    assert moved["ok"] is True
+    assert stale_task.workspace == str(new_dir.resolve())
+    assert manager.task_store.get(stale_task.id).workspace == str(new_dir.resolve())
+    record = manager.session_store.load(run.session_id)
+    assert record.project_id == project["project_id"]
+    assert record.workspace == str(new_dir.resolve())
 
 
 def test_task_engine_has_no_scheduling_tools(tmp_path, monkeypatch):

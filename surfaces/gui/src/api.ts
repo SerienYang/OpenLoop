@@ -116,6 +116,14 @@ export async function getProjects(opts: { includeHidden?: boolean } = {}): Promi
   return d.projects ?? [];
 }
 
+export async function getProjectByPath(
+  path: string,
+): Promise<{ ok: boolean; error?: string; project?: ProjectInfo | null }> {
+  const q = new URLSearchParams({ path });
+  const res = await fetch(`${httpBase()}/v1/projects/by-path?${q.toString()}`);
+  return res.json();
+}
+
 export async function createProject(
   name: string,
   path: string,

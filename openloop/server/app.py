@@ -261,7 +261,9 @@ def create_app(manager: SessionManager) -> FastAPI:
                 continue
             d["session_title"] = (rec.title if rec else None) or i.session_id
             d["session_agent"] = rec.agent if rec else None
-            d["session_workspace"] = rec.workspace if rec else None
+            d["session_workspace"] = (
+                manager.session_workspace(i.session_id) if rec else None
+            )
             d["session_exists"] = rec is not None
             out.append(d)
         return {"items": out}
@@ -396,7 +398,10 @@ def create_app(manager: SessionManager) -> FastAPI:
     @app.get("/v1/sessions/{session_id}/skills")
     def session_skills(session_id: str, workspace: str = "") -> dict[str, Any]:
         # The rail's Skills group + the composer popup both read this (SKILLS-SPEC §4.1).
-        return manager.session_skills_view(session_id, workspace or None)
+        effective_workspace = manager.engine_workspace(
+            session_id, workspace=workspace or None
+        )
+        return manager.session_skills_view(session_id, effective_workspace)
 
     @app.post("/v1/sessions/{session_id}/skills")
     def set_session_skill(session_id: str, body: dict) -> dict[str, Any]:
@@ -412,9 +417,10 @@ def create_app(manager: SessionManager) -> FastAPI:
             manager.session_skills.set(
                 session_id, skill, bool(body.get("enabled", False))
             )
-        return manager.session_skills_view(
-            session_id, str(body.get("workspace", "")) or None
+        effective_workspace = manager.engine_workspace(
+            session_id, workspace=str(body.get("workspace", "")) or None
         )
+        return manager.session_skills_view(session_id, effective_workspace)
 
     @app.get("/v1/skills")
     def skills(workspace: str = "") -> dict[str, Any]:
@@ -488,6 +494,10 @@ def create_app(manager: SessionManager) -> FastAPI:
     @app.get("/v1/projects")
     def projects_list(include_hidden: bool = False) -> dict[str, Any]:
         return {"projects": manager.list_projects(include_hidden=include_hidden)}
+
+    @app.get("/v1/projects/by-path")
+    def projects_by_path(path: str = "") -> dict[str, Any]:
+        return manager.project_by_path(path)
 
     @app.post("/v1/projects")
     def projects_create(body: dict) -> dict[str, Any]:
@@ -1361,56 +1371,69 @@ def create_app(manager: SessionManager) -> FastAPI:
 
         workspace = ws.query_params.get("workspace")
         project_id = ws.query_params.get("project_id") or None
-        project_workspace = manager.project_workspace(project_id)
-        if project_id and project_workspace:
-            workspace = project_workspace
-        mcp_tools = await manager.prepare_mcp_tools(
-            session_id, workspace=workspace, agent=agent
+        preparation_token = manager.begin_project_session_preparation(
+            session_id, project_id
         )
-        engine = manager.get_engine(
-            session_id,
-            workspace=workspace,
-            project_id=project_id,
-            agent=agent,
-            approver=approver,
-            extra_tools=mcp_tools,
-            directory_requester=directory_requester,
-            plan_approver=plan_approver,
-            question_asker=question_asker,
-        )
-        if engine is None:
+        try:
+            project_workspace = manager.project_workspace(project_id)
+            if project_id and project_workspace:
+                workspace = project_workspace
+            mcp_tools = await manager.prepare_mcp_tools(
+                session_id, workspace=workspace, agent=agent
+            )
+            engine = manager.get_engine(
+                session_id,
+                workspace=workspace,
+                project_id=project_id,
+                agent=agent,
+                approver=approver,
+                extra_tools=mcp_tools,
+                directory_requester=directory_requester,
+                plan_approver=plan_approver,
+                question_asker=question_asker,
+            )
+            if engine is None:
+                await ws.send_json(
+                    {
+                        "type": "error",
+                        "data": {
+                            "error": "no valid workspace — choose a project folder first"
+                        },
+                    }
+                )
+                await ws.close()
+                return
+            # Auto-compaction failure prompt (OPE-27): only an ATTENDED session may be asked
+            # Retry/Trim — unattended runs auto-trim (the policy in engine._compact_now).
+            engine.is_attended = lambda: _visibility() == VIS_INLINE
             await ws.send_json(
                 {
-                    "type": "error",
+                    "type": "ready",
                     "data": {
-                        "error": "no valid workspace — choose a project folder first"
+                        "session_id": session_id,
+                        "agent": getattr(engine, "agent_name", "openloop"),
+                        "model": engine.model,
+                        "mode": engine.permissions.mode.value,
+                        "workspace": (
+                            str(getattr(engine, "executor").cwd)
+                            if getattr(engine, "executor", None)
+                            else None
+                        ),
+                        "command_trust": manager.workspace_command_trust(
+                            str(
+                                getattr(engine, "audit_context", {}).get(
+                                    "workspace", ""
+                                )
+                            )
+                        ),
                     },
                 }
             )
-            await ws.close()
-            return
-        # Auto-compaction failure prompt (OPE-27): only an ATTENDED session may be asked
-        # Retry/Trim — unattended runs auto-trim (the policy in engine._compact_now).
-        engine.is_attended = lambda: _visibility() == VIS_INLINE
-        await ws.send_json(
-            {
-                "type": "ready",
-                "data": {
-                    "session_id": session_id,
-                    "agent": getattr(engine, "agent_name", "openloop"),
-                    "model": engine.model,
-                    "mode": engine.permissions.mode.value,
-                    "workspace": (
-                        str(getattr(engine, "executor").cwd)
-                        if getattr(engine, "executor", None)
-                        else None
-                    ),
-                    "command_trust": manager.workspace_command_trust(
-                        str(getattr(engine, "audit_context", {}).get("workspace", ""))
-                    ),
-                },
-            }
-        )
+            # Register before releasing the preparation token, so relocation sees either
+            # an in-flight setup or a live client with no unprotected gap between them.
+            manager.register_session_client(session_id, ws.send_json)
+        finally:
+            manager.end_project_session_preparation(preparation_token)
 
         # Checkpoint events: persist mid-turn so a crash/quit can't eat the conversation.
         # turn_start = the user message just landed (a brand-new session gets its row here,
@@ -1443,16 +1466,17 @@ def create_app(manager: SessionManager) -> FastAPI:
                     if event.type.value in _CHECKPOINTS:
                         manager.save(session_id, engine)
             finally:
-                manager.mark_idle(session_id)
+                try:
+                    manager.save(session_id, engine)
+                finally:
+                    manager.mark_idle(session_id)
                 await manager.broadcast_running_state()
-                manager.save(session_id, engine)
                 await manager.broadcast_session(
                     session_id, {"type": "turn_done", "data": {}}
                 )
 
         # This socket is now a live view of the session; background turns (channel delivery,
         # self-wake, durable resume) broadcast here too, not just locally driven run_turns.
-        manager.register_session_client(session_id, ws.send_json)
         inbound_times: deque[float] = deque()
 
         async def reject_input(reason: str) -> None:

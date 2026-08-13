@@ -48,8 +48,6 @@ def main(argv: Optional[list[str]] = None) -> None:
             print(f"project not found: {args.project}", file=sys.stderr)
             raise SystemExit(1)
         workspace = Path(proj["path"]).resolve()
-    session_store.touch_workspace(os.path.realpath(str(workspace)))
-
     resume_messages = None
     session_id = args.resume or uuid.uuid4().hex[:12]
     model, mode = args.model, args.mode
@@ -58,6 +56,19 @@ def main(argv: Optional[list[str]] = None) -> None:
         if record is not None:
             resume_messages = record.messages
             model, mode = record.model, record.mode
+            if record.project_id:
+                project = session_store.get_project(record.project_id)
+                if project is None or not Path(project["path"]).is_dir():
+                    print(
+                        "project folder is missing; relocate it in OpenLoop first",
+                        file=sys.stderr,
+                    )
+                    raise SystemExit(1)
+                workspace = Path(project["path"]).resolve()
+            elif record.workspace:
+                workspace = Path(record.workspace).expanduser().resolve()
+
+    session_store.touch_workspace(os.path.realpath(str(workspace)))
 
     from .tui.app import OpenLoopApp
 

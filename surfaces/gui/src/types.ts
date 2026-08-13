@@ -67,6 +67,9 @@ export interface SessionInfo {
   workspace: string;
   // Codex-style first-class project this session belongs to (null = plain session).
   project_id?: string | null;
+  project_name?: string | null;
+  project_path?: string | null;
+  project_path_exists?: boolean | null;
   agent: string;
   model: string;
   mode: string;

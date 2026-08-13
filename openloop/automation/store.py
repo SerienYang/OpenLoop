@@ -9,6 +9,7 @@ request handlers touch it from different threads.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -119,6 +120,58 @@ class TaskStore:
                 "SELECT data FROM scheduled_tasks ORDER BY next_run IS NULL, next_run"
             ).fetchall()
         return [ScheduledTask.from_dict(json.loads(r["data"])) for r in rows]
+
+    def relocate_workspace(self, old_path: str, new_path: str) -> list[str]:
+        old_canonical = os.path.realpath(os.path.expanduser(str(old_path)))
+        new_canonical = os.path.realpath(os.path.expanduser(str(new_path)))
+        changed: list[str] = []
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT id, data FROM scheduled_tasks"
+                ).fetchall()
+                for row in rows:
+                    data = json.loads(row["data"])
+                    workspace = os.path.realpath(
+                        os.path.expanduser(str(data.get("workspace") or ""))
+                    )
+                    if workspace != old_canonical:
+                        continue
+                    data["workspace"] = new_canonical
+                    self._conn.execute(
+                        "UPDATE scheduled_tasks SET data = ? WHERE id = ?",
+                        (json.dumps(data), row["id"]),
+                    )
+                    changed.append(str(row["id"]))
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return changed
+
+    def set_task_workspaces(self, task_ids: list[str], path: str) -> None:
+        if not task_ids:
+            return
+        canonical = os.path.realpath(os.path.expanduser(str(path)))
+        with self._lock:
+            try:
+                for task_id in task_ids:
+                    row = self._conn.execute(
+                        "SELECT data FROM scheduled_tasks WHERE id = ?",
+                        (task_id,),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    data = json.loads(row["data"])
+                    data["workspace"] = canonical
+                    self._conn.execute(
+                        "UPDATE scheduled_tasks SET data = ? WHERE id = ?",
+                        (json.dumps(data), task_id),
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def delete(self, task_id: str) -> bool:
         with self._lock:

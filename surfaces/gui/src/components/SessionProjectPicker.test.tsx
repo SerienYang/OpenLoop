@@ -23,6 +23,10 @@ function renderPicker() {
   );
 }
 
+function jsonResponse(body: unknown) {
+  return Promise.resolve({ json: async () => body });
+}
+
 const PROJECTS = [
   {
     project_id: "p-content",
@@ -50,10 +54,16 @@ describe("SessionProjectPicker", () => {
   afterEach(() => {
     cleanup();
     chooseFolderMock.mockReset();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it("opens the folder picker on 'New project…' and backfills path + name", async () => {
     chooseFolderMock.mockResolvedValue("/tmp/my-project");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => jsonResponse({ ok: true, project: null })),
+    );
     renderPicker();
 
     fireEvent.click(screen.getByRole("button", { name: "This session belongs to" }));
@@ -127,5 +137,141 @@ describe("SessionProjectPicker", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "内容策略平台" }));
 
     expect(onProjectSelected).toHaveBeenCalledWith(PROJECTS[0]);
+  });
+
+  it("selecting a folder already registered as a project assigns the existing project", async () => {
+    chooseFolderMock.mockResolvedValue("/tmp/content");
+    const onProjectSelected = vi.fn();
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/v1/projects/by-path")) {
+        return jsonResponse({ ok: true, project: PROJECTS[0] });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <SessionProjectPicker
+        sessionId="s1"
+        projects={PROJECTS}
+        onProjectsChanged={() => {}}
+        onProjectSelected={onProjectSelected}
+        initialProjectId={null}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "This session belongs to" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "New project…" }));
+
+    await waitFor(() => expect(onProjectSelected).toHaveBeenCalledWith(PROJECTS[0]));
+    expect(screen.queryByPlaceholderText("Project name")).toBeNull();
+    expect(
+      fetchMock.mock.calls.some(([url]) => String(url).includes("/v1/projects/by-path")),
+    ).toBe(true);
+  });
+
+  it("reopens an exact hidden project before assigning it", async () => {
+    chooseFolderMock.mockResolvedValue("/tmp/removed");
+    const reopenedProject = { ...PROJECTS[1], hidden: false };
+    const onProjectSelected = vi.fn();
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/v1/projects/by-path")) {
+        return jsonResponse({ ok: true, project: PROJECTS[1] });
+      }
+      if (url.includes("/v1/projects/p-removed") && init?.method === "PATCH") {
+        return jsonResponse({ ok: true, project: reopenedProject });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <SessionProjectPicker
+        sessionId="s1"
+        projects={PROJECTS}
+        onProjectsChanged={() => {}}
+        onProjectSelected={onProjectSelected}
+        initialProjectId={null}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "This session belongs to" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "New project…" }));
+
+    await waitFor(() =>
+      expect(onProjectSelected).toHaveBeenCalledWith(reopenedProject),
+    );
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) =>
+          String(url).includes("/v1/projects/p-removed") &&
+          (init as RequestInit | undefined)?.method === "PATCH",
+      ),
+    ).toBe(true);
+  });
+
+  it("fails closed when the existing-project lookup fails", async () => {
+    chooseFolderMock.mockResolvedValue("/tmp/content");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        jsonResponse({ ok: false, error: "lookup unavailable" }),
+      ),
+    );
+    renderPicker();
+
+    fireEvent.click(screen.getByRole("button", { name: "This session belongs to" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "New project…" }));
+
+    await screen.findByText("lookup unavailable");
+    expect(screen.queryByPlaceholderText("Project name")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Create & assign" })).toBeNull();
+  });
+
+  it("offers to relocate one missing project instead of creating a duplicate", async () => {
+    const missingProject = {
+      ...PROJECTS[0],
+      project_id: "p-missing",
+      name: "content",
+      path: "/tmp/old/content",
+      path_exists: false,
+    };
+    const relocatedProject = {
+      ...missingProject,
+      path: "/tmp/new/content",
+      path_exists: true,
+    };
+    chooseFolderMock.mockResolvedValue("/tmp/new/content");
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const onProjectSelected = vi.fn();
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/v1/projects/by-path")) {
+        return jsonResponse({ ok: true, project: null });
+      }
+      if (url.includes("/v1/projects/p-missing") && init?.method === "PATCH") {
+        return jsonResponse({ ok: true, project: relocatedProject });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <SessionProjectPicker
+        sessionId="s1"
+        projects={[missingProject]}
+        onProjectsChanged={() => {}}
+        onProjectSelected={onProjectSelected}
+        initialProjectId={null}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "This session belongs to" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "New project…" }));
+
+    await waitFor(() =>
+      expect(onProjectSelected).toHaveBeenCalledWith(relocatedProject),
+    );
+    expect(window.confirm).toHaveBeenCalled();
+    expect(screen.queryByPlaceholderText("Project name")).toBeNull();
   });
 });

@@ -499,6 +499,13 @@ class ConversationStore:
         return cur.rowcount > 0
 
     # -- projects (Codex-style first-class entities) ----------------------------
+    @staticmethod
+    def _canonical_project_path(path: str | Path) -> str:
+        raw = str(path or "").strip()
+        if not raw:
+            return ""
+        return os.path.realpath(os.path.expanduser(raw))
+
     def _project_payload(self, row: sqlite3.Row | dict) -> dict:
         data = dict(row)
         path = data.get("path") or ""
@@ -519,7 +526,7 @@ class ConversationStore:
         The path must be unique — a folder maps to at most one project.
         """
         name = " ".join(str(name or "").split())[:120]
-        path = os.path.realpath(os.path.expanduser(str(path or "").strip()))
+        path = self._canonical_project_path(path)
         if not name:
             return {"ok": False, "error": "project name is required"}
         if not path:
@@ -600,12 +607,22 @@ class ConversationStore:
 
     def project_by_path(self, path: str) -> Optional[dict]:
         """The project bound to this canonical workspace path, if any."""
-        canonical = os.path.realpath(os.path.expanduser(str(path)))
+        canonical = self._canonical_project_path(path)
+        if not canonical:
+            return None
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM projects WHERE path = ?", (canonical,)
+                "SELECT project_id FROM projects WHERE path = ?", (canonical,)
             ).fetchone()
-        return dict(row) if row else None
+        return self.get_project(row["project_id"]) if row else None
+
+    def session_ids_for_project(self, project_id: str) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT session_id FROM sessions WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+        return [str(row["session_id"]) for row in rows]
 
     def update_project(
         self,
@@ -632,28 +649,37 @@ class ConversationStore:
         if hidden is not None:
             sets.append("hidden = ?")
             params.append(1 if hidden else 0)
+        canonical_path = None
         if path is not None:
-            canonical = os.path.realpath(os.path.expanduser(str(path).strip()))
-            if not canonical:
-                return False
-            with self._lock:
-                existing = self._conn.execute(
-                    "SELECT project_id FROM projects WHERE path = ? AND project_id != ?",
-                    (canonical, project_id),
-                ).fetchone()
-            if existing:
+            canonical_path = self._canonical_project_path(path)
+            if not canonical_path:
                 return False
             sets.append("path = ?")
-            params.append(canonical)
+            params.append(canonical_path)
         if not sets:
             return False
         sets.append("updated_at = CURRENT_TIMESTAMP")
         params.append(project_id)
         with self._lock:
+            if canonical_path is not None:
+                existing = self._conn.execute(
+                    "SELECT project_id FROM projects WHERE path = ? AND project_id != ?",
+                    (canonical_path, project_id),
+                ).fetchone()
+                if existing:
+                    return False
             cur = self._conn.execute(
                 f"UPDATE projects SET {', '.join(sets)} WHERE project_id = ?",
                 tuple(params),
             )
+            if cur.rowcount > 0 and canonical_path is not None:
+                self._conn.execute(
+                    """UPDATE sessions
+                       SET workspace = ?, workspace_kind = 'project',
+                           managed_root = NULL
+                       WHERE project_id = ?""",
+                    (canonical_path, project_id),
+                )
             self._conn.commit()
         return cur.rowcount > 0
 
@@ -682,8 +708,10 @@ class ConversationStore:
                 bool(data.get("project_hidden")) if data.get("project_id") else False
             )
             project_path = data.get("project_path") or ""
+            if project_path:
+                data["workspace"] = project_path
             data["project_path_exists"] = (
-                Path(project_path).expanduser().is_dir() if project_path else False
+                Path(project_path).expanduser().is_dir() if project_path else None
             )
             out.append(data)
         return out
@@ -703,15 +731,32 @@ class ConversationStore:
         return cur.rowcount > 0
 
     def set_session_project(
-        self, session_id: str, project_id: Optional[str]
+        self,
+        session_id: str,
+        project_id: Optional[str],
+        *,
+        project_path: Optional[str] = None,
     ) -> bool:
         """Bind a session to a project (or unbind with None)."""
         with self._lock:
-            cur = self._conn.execute(
-                "UPDATE sessions SET project_id = ?, updated_at = CURRENT_TIMESTAMP "
-                "WHERE session_id = ?",
-                (project_id, session_id),
-            )
+            if project_id is not None and project_path:
+                cur = self._conn.execute(
+                    """UPDATE sessions
+                       SET project_id = ?, workspace = ?, workspace_kind = 'project',
+                           managed_root = NULL, updated_at = CURRENT_TIMESTAMP
+                       WHERE session_id = ?""",
+                    (
+                        project_id,
+                        self._canonical_project_path(project_path),
+                        session_id,
+                    ),
+                )
+            else:
+                cur = self._conn.execute(
+                    "UPDATE sessions SET project_id = ?, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE session_id = ?",
+                    (project_id, session_id),
+                )
             self._conn.commit()
         return cur.rowcount > 0
 

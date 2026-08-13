@@ -1,6 +1,13 @@
 import { useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
-import { createProject, setSessionProject, type ProjectInfo } from "../api";
+import {
+  createProject,
+  getProjectByPath,
+  relocateProject,
+  reopenProject,
+  setSessionProject,
+  type ProjectInfo,
+} from "../api";
 import { chooseFolder } from "../tauri";
 import { baseName } from "../paths";
 import { useI18n } from "../i18n";
@@ -90,6 +97,79 @@ export function SessionProjectPicker({
       onProjectsChanged();
     } else {
       setAssignErr(r.error || t("Could not assign this session to the project"));
+    }
+  };
+
+  const selectResolvedProject = async (project: ProjectInfo) => {
+    if (onProjectSelected) {
+      setAssign(project.project_id);
+      onProjectSelected(project);
+      onProjectsChanged();
+      return;
+    }
+    await bindProject(project.project_id);
+  };
+
+  const resolvePickedProject = async (
+    picked: string,
+  ): Promise<"resolved" | "unmatched" | "failed"> => {
+    setAssignBusy(true);
+    setAssignErr("");
+    try {
+      const found = await getProjectByPath(picked);
+      if (!found.ok) {
+        setAssignErr(found.error || t("Could not check the project folder"));
+        return "failed";
+      }
+      if (found.project) {
+        let project = found.project;
+        if (project.hidden) {
+          const reopened = await reopenProject(project.project_id);
+          if (!reopened.ok || !reopened.project) {
+            setAssignErr(reopened.error || t("Could not reopen the project."));
+            return "failed";
+          }
+          project = reopened.project;
+        }
+        await selectResolvedProject(project);
+        setOpen(false);
+        return "resolved";
+      }
+
+      const pickedName = baseName(picked).trim();
+      const candidates = projects.filter(
+        (project) =>
+          !project.hidden &&
+          project.path_exists === false &&
+          (project.name.trim() === pickedName ||
+            baseName(project.path).trim() === pickedName),
+      );
+      if (
+        candidates.length === 1 &&
+        window.confirm(
+          t(
+            'The folder for project "{{name}}" is missing. Relocate it to the selected folder?',
+            { name: candidates[0].name },
+          ),
+        )
+      ) {
+        const relocated = await relocateProject(candidates[0].project_id, picked);
+        if (!relocated.ok || !relocated.project) {
+          setAssignErr(
+            relocated.error || t("Could not update the project folder."),
+          );
+          return "failed";
+        }
+        await selectResolvedProject(relocated.project);
+        setOpen(false);
+        return "resolved";
+      }
+      return "unmatched";
+    } catch {
+      setAssignErr(t("Could not check the project folder"));
+      return "failed";
+    } finally {
+      setAssignBusy(false);
     }
   };
 
@@ -205,8 +285,13 @@ export function SessionProjectPicker({
                 setAssign(NEW_PROJECT);
                 const picked = await chooseFolder();
                 if (picked) {
-                  setNewPath(picked);
-                  setNewName((n) => (n.trim() ? n : baseName(picked)));
+                  const resolved = await resolvePickedProject(picked);
+                  if (resolved === "unmatched") {
+                    setNewPath(picked);
+                    setNewName((n) => (n.trim() ? n : baseName(picked)));
+                  } else if (resolved === "failed") {
+                    setAssign("");
+                  }
                 }
               }}
             >
@@ -250,9 +335,9 @@ export function SessionProjectPicker({
                     {t("Cancel")}
                   </button>
                 </div>
-                {assignErr && <div className="gate-error">{assignErr}</div>}
               </div>
             )}
+            {assignErr && <div className="gate-error mx-2 mt-1">{assignErr}</div>}
           </div>
           </>,
           document.body,
