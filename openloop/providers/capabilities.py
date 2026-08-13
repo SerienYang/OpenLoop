@@ -9,7 +9,16 @@ from __future__ import annotations
 from .base import ModelCapabilities
 
 
+def _opencode_go_vision(name: str) -> bool:
+    if name.startswith(("gpt-", "grok-", "kimi-", "qwen")):
+        return True
+    return name.startswith("mimo-") and "pro" not in name
+
+
 def capabilities_for(model: str) -> ModelCapabilities:
+    provider = model.split(":", 1)[0].lower() if ":" in model else ""
+    name = model.split(":", 1)[-1].lower()  # strip a provider prefix if present
+
     # Curated models answer from the matrix (exact full-id match — including reseller ids
     # like `together:zai-org/GLM-5.2`, whose names defeat the prefix heuristics below).
     # Custom user-added models fall through to the heuristics, at their own risk.
@@ -17,10 +26,18 @@ def capabilities_for(model: str) -> ModelCapabilities:
 
     entry = entry_for(model)
     if entry is not None:
+        if provider == "opencode-go":
+            # OpenCode Go exposes only model ids from /models. Reuse the canonical model's
+            # classification plus provider family rules while retaining gateway constraints.
+            canonical = capabilities_for(name)
+            return ModelCapabilities(
+                tools=entry.caps.tools,
+                vision=canonical.vision or _opencode_go_vision(name),
+                pdf=entry.caps.pdf,
+                parallel_tool_calls=entry.caps.parallel_tool_calls,
+                streaming=entry.caps.streaming,
+            )
         return entry.caps
-
-    provider = model.split(":", 1)[0].lower() if ":" in model else ""
-    name = model.split(":", 1)[-1].lower()  # strip a provider prefix if present
 
     # Ollama (local) models vary widely and many fake/mishandle parallel tool calls — assume
     # tools work (we only point at tool-capable models) but stay conservative otherwise.
