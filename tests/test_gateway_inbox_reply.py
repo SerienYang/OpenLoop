@@ -11,7 +11,7 @@ from openloop.inbox import InboxStore
 from openloop.inbox_routing import resolve_from_reply
 
 
-async def test_inbound_reply_resolves_item_and_is_not_routed(tmp_path):
+async def test_inbound_approval_text_is_consumed_without_resolving(tmp_path):
     inbox = InboxStore(tmp_path / "inbox.json")
     item = inbox.add_approval("s1", "Restart service?", inbox="ops")
 
@@ -21,7 +21,14 @@ async def test_inbound_reply_resolves_item_and_is_not_routed(tmp_path):
         routed.append(ev)
 
     def reply_resolver(ev: MessageEvent) -> bool:
-        return resolve_from_reply(ev.text, inbox.resolve) is not None
+        return (
+            resolve_from_reply(
+                ev.text,
+                inbox.resolve,
+                kind_for=lambda item_id: inbox.get(item_id).kind,
+            )
+            is not None
+        )
 
     settings = {"fake": ConnectorSettings("fake", enabled=True, allowed_users={"u1"})}
     gw = Gateway(settings=settings, handler=handler, reply_resolver=reply_resolver)
@@ -29,9 +36,10 @@ async def test_inbound_reply_resolves_item_and_is_not_routed(tmp_path):
     gw.register(fake)
     await gw.start()
 
-    # An inbound approval reply: resolves the item, NOT routed to the handler.
-    await fake.inject(f"approve [ol:{item.id}]", user_id="u1")
-    assert inbox.get(item.id).resolution == "allow"
+    # Ordinary text cannot authorize an approval, and the correlated reply is not a new turn.
+    await fake.inject(f"yes [ol:{item.id}]", user_id="u1")
+    assert inbox.get(item.id).state == "pending"
+    assert inbox.get(item.id).resolution is None
     assert routed == []
 
     # A normal message (no token) still goes to the handler.
@@ -53,8 +61,14 @@ async def test_freetext_answer_to_question_is_consumed(tmp_path):
     gw = Gateway(
         settings=settings,
         handler=handler,
-        reply_resolver=lambda ev: resolve_from_reply(ev.text, inbox.resolve)
-        is not None,
+        reply_resolver=lambda ev: (
+            resolve_from_reply(
+                ev.text,
+                inbox.resolve,
+                kind_for=lambda item_id: inbox.get(item_id).kind,
+            )
+            is not None
+        ),
     )
     fake = FakeAdapter()
     gw.register(fake)

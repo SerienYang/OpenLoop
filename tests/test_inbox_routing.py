@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+
+import pytest
 
 from openloop.inbox import InboxStore
 from openloop.inbox_routing import (
@@ -62,20 +65,37 @@ def test_in_app_only_binding_delivers_nothing(tmp_path):
     assert calls == []
 
 
-def test_inbound_reply_resolves_correct_item(tmp_path):
+@pytest.mark.parametrize(
+    "answer",
+    ["yes", "no", "allow", "deny", "approve", "always", "👍", "❌"],
+)
+def test_approval_text_reply_never_resolves_pending_item(tmp_path, answer):
     store = InboxStore(tmp_path / "inbox.json")
     item = store.add_approval("s1", "Deploy?", inbox="ops")
-    # Current token spelling…
-    ok = resolve_from_reply(f"approve [ol:{item.id}]", store.resolve)
-    assert ok is True
-    assert store.get(item.id).resolution == "allow"
+    waiter = store._waiters.setdefault(item.id, asyncio.Event())
+
+    result = resolve_from_reply(
+        f"{answer} [ol:{item.id}]",
+        store.resolve,
+        kind_for=lambda item_id: store.get(item_id).kind,
+    )
+
+    assert result is False
+    assert store.get(item.id).state == "pending"
+    assert store.get(item.id).resolution is None
+    assert waiter.is_set() is False
 
 
-def test_inbound_freetext_answer_to_question(tmp_path):
+@pytest.mark.parametrize("answer", ["yes", "no", "allow", "deny"])
+def test_same_text_replies_still_resolve_questions(tmp_path, answer):
     store = InboxStore(tmp_path / "inbox.json")
     q = store.add_question("s1", "Which region?")
-    res = resolve_from_reply(f"us-east-1 [ol:{q.id}]", store.resolve)
-    assert res is True and store.get(q.id).resolution == "us-east-1"
+    res = resolve_from_reply(
+        f"{answer} [ol:{q.id}]",
+        store.resolve,
+        kind_for=lambda item_id: store.get(item_id).kind,
+    )
+    assert res is True and store.get(q.id).resolution == answer
 
 
 def test_reply_without_token_is_ignored(tmp_path):
@@ -90,35 +110,15 @@ def test_legacy_inbox_tokens_are_ignored(tmp_path):
     assert store.get(item.id).state == "pending"
 
 
-def test_disallow_is_not_parsed_as_allow(tmp_path):
-    store = InboxStore(tmp_path / "inbox.json")
-    item = store.add_approval("s1", "Deploy?", inbox="ops")
-    assert resolve_from_reply(f"disallow [ol:{item.id}]", store.resolve) is True
-    assert store.get(item.id).resolution != "allow"
-
-
 def test_words_containing_no_are_not_parsed_as_deny(tmp_path):
     store = InboxStore(tmp_path / "inbox.json")
     q = store.add_question("s1", "Which region?")
-    assert resolve_from_reply(f"north-east node [ol:{q.id}]", store.resolve) is True
+    assert (
+        resolve_from_reply(
+            f"north-east node [ol:{q.id}]",
+            store.resolve,
+            kind_for=lambda item_id: store.get(item_id).kind,
+        )
+        is True
+    )
     assert store.get(q.id).resolution == "north-east node"
-
-
-def test_denied_and_approved_word_forms(tmp_path):
-    store = InboxStore(tmp_path / "inbox.json")
-    a = store.add_approval("s1", "Deploy?", inbox="ops")
-    b = store.add_approval("s1", "Restart?", inbox="ops")
-    resolve_from_reply(f"denied [ol:{a.id}]", store.resolve)
-    resolve_from_reply(f"approved [ol:{b.id}]", store.resolve)
-    assert store.get(a.id).resolution == "deny"
-    assert store.get(b.id).resolution == "allow"
-
-
-def test_emoji_reactions_still_resolve(tmp_path):
-    store = InboxStore(tmp_path / "inbox.json")
-    a = store.add_approval("s1", "Deploy?", inbox="ops")
-    b = store.add_approval("s1", "Restart?", inbox="ops")
-    resolve_from_reply(f"👍 [ol:{a.id}]", store.resolve)
-    resolve_from_reply(f"❌ [ol:{b.id}]", store.resolve)
-    assert store.get(a.id).resolution == "allow"
-    assert store.get(b.id).resolution == "deny"

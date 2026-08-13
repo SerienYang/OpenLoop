@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
+
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -121,15 +125,242 @@ def test_question_resolution_endpoint_binds_item_session_and_attachments(tmp_pat
             "attachments": [image],
         },
     )
+    replay = client.post(
+        f"/v1/pending/{question.id}/resolve-question",
+        json={
+            "session_id": "s1",
+            "response_id": "response-question",
+            "answer": "Use this",
+            "attachments": [image],
+        },
+    )
+    competing = client.post(
+        f"/v1/pending/{question.id}/resolve-question",
+        json={
+            "session_id": "s1",
+            "response_id": "response-from-other-window",
+            "answer": "Use something else",
+            "attachments": [],
+        },
+    )
 
     assert wrong_kind.status_code == 400
     assert manager.pending.get(approval.id).state == "pending"
     assert accepted.status_code == 200
     assert accepted.json()["status"] == "accepted"
+    assert replay.json()["status"] == "accepted_replay"
+    assert competing.json()["status"] == "already_resolved"
     saved = manager.pending.question_answer(question.id)
     assert saved["item_id"] == question.id
     assert saved["content"][0] == {"type": "text", "text": "Use this"}
     assert saved["content"][1]["type"] == "image_url"
+
+
+def test_question_resolution_claims_resume_before_resolved_broadcast(
+    tmp_path, monkeypatch
+):
+    manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    question = manager.pending.add_question(
+        "s1", "Question", tool_call_id="call-question"
+    )
+
+    async def scenario():
+        broadcast_entered = asyncio.Event()
+        release_broadcast = asyncio.Event()
+        resume_started = asyncio.Event()
+        resume_started_while_claimed = False
+
+        async def blocking_broadcast(session_id, message):
+            assert session_id == "s1"
+            assert message["type"] == "question_resolved"
+            broadcast_entered.set()
+            await release_broadcast.wait()
+
+        async def observe_resume(_item):
+            nonlocal resume_started_while_claimed
+            resume_started_while_claimed = manager.is_running("s1")
+            resume_started.set()
+
+        monkeypatch.setattr(manager, "broadcast_session", blocking_broadcast)
+        monkeypatch.setattr(manager, "_durable_resume", observe_resume)
+
+        resolution = asyncio.create_task(
+            manager.resolve_question(
+                question.id,
+                expected_session_id="s1",
+                response_id="response-1",
+                answer="answer",
+            )
+        )
+        await asyncio.wait_for(broadcast_entered.wait(), timeout=1)
+
+        competing_claim = manager.try_mark_running("s1")
+        if competing_claim:
+            manager.mark_idle("s1")
+        release_broadcast.set()
+
+        result = await asyncio.wait_for(resolution, timeout=1)
+        await asyncio.wait_for(resume_started.wait(), timeout=1)
+        for _ in range(100):
+            if not manager._question_resume_tasks:
+                break
+            await asyncio.sleep(0.01)
+
+        assert result["status"] == "accepted"
+        assert competing_claim is False
+        assert resume_started_while_claimed is True
+        assert manager._question_resume_tasks == set()
+        assert manager.is_running("s1") is False
+
+    asyncio.run(scenario())
+
+
+def test_question_resolution_rest_returns_before_durable_resume_second_question(
+    tmp_path,
+):
+    manager = SessionManager(
+        workspace=tmp_path,
+        provider=ScriptedProvider(
+            [
+                _tool("ask_user", {"question": "First?"}, "call-question-1"),
+                _tool("ask_user", {"question": "Second?"}, "call-question-2"),
+                _text("Both answers received."),
+            ]
+        ),
+    )
+    session_id = "question-durable-rest"
+
+    async def scenario():
+        engine = manager.get_engine(
+            session_id, agent="openloop", workspace=str(tmp_path)
+        )
+
+        async def run_first_turn():
+            async for _ in engine.run("start"):
+                pass
+
+        turn_task = asyncio.create_task(run_first_turn())
+        first = None
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            pending = manager.pending.pending(session_id)
+            if pending:
+                first = pending[0]
+                break
+        assert first is not None
+        turn_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await turn_task
+        manager._engines.pop(session_id, None)
+        manager.mark_idle(session_id)
+
+        transport = httpx.ASGITransport(app=create_app(manager))
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            first_response = await asyncio.wait_for(
+                client.post(
+                    f"/v1/pending/{first.id}/resolve-question",
+                    json={
+                        "session_id": session_id,
+                        "response_id": "response-1",
+                        "answer": "one",
+                        "attachments": [],
+                    },
+                ),
+                timeout=1,
+            )
+
+            assert first_response.json()["status"] == "accepted"
+            resume_tasks = list(manager._question_resume_tasks)
+            assert len(resume_tasks) == 1
+
+            second = None
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+                pending = manager.pending.pending(session_id)
+                if pending:
+                    second = pending[0]
+                    break
+            assert second is not None and second.id != first.id
+
+            second_response = await client.post(
+                f"/v1/pending/{second.id}/resolve-question",
+                json={
+                    "session_id": session_id,
+                    "response_id": "response-2",
+                    "answer": "two",
+                    "attachments": [],
+                },
+            )
+            assert second_response.json()["status"] == "accepted"
+            await asyncio.wait_for(asyncio.gather(*resume_tasks), timeout=1)
+
+    asyncio.run(scenario())
+
+    record = manager.session_store.load(session_id)
+    answer_messages = [
+        message for message in record.messages if message.get("_question_response")
+    ]
+    assert [message["content"] for message in answer_messages] == ["one", "two"]
+    response_items = [
+        entry["item_id"]
+        for message in answer_messages
+        for entry in message.get("_question_response", [])
+    ]
+    assert len(response_items) == 2
+    assert len(set(response_items)) == 2
+    assert manager.pending.pending(session_id) == []
+
+
+def test_question_resolution_background_resume_failure_is_logged_and_recoverable(
+    tmp_path, monkeypatch, caplog
+):
+    manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    question = manager.pending.add_question(
+        "s1", "Question", tool_call_id="call-question"
+    )
+    caplog.set_level(logging.ERROR, logger="openloop.manager")
+
+    async def scenario():
+        attempted = asyncio.Event()
+
+        async def fail_resume(_item):
+            attempted.set()
+            raise RuntimeError("resume failed")
+
+        monkeypatch.setattr(manager, "_durable_resume", fail_resume)
+        transport = httpx.ASGITransport(
+            app=create_app(manager), raise_app_exceptions=False
+        )
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            response = await client.post(
+                f"/v1/pending/{question.id}/resolve-question",
+                json={
+                    "session_id": "s1",
+                    "response_id": "response-1",
+                    "answer": "answer",
+                    "attachments": [],
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "accepted"
+        await asyncio.wait_for(attempted.wait(), timeout=1)
+        for _ in range(100):
+            if not manager._question_resume_tasks:
+                break
+            await asyncio.sleep(0.01)
+        assert manager._question_resume_tasks == set()
+
+    asyncio.run(scenario())
+
+    saved = manager.pending.get(question.id)
+    assert saved.data["answer_content"] == "answer"
+    assert "durable question resume for session s1" in caplog.text
+    assert "RuntimeError: resume failed" in caplog.text
 
 
 def test_generic_pending_resolve_fails_closed_for_questions(tmp_path):
@@ -598,6 +829,7 @@ def test_ws_question_can_be_answered_with_attachment_over_rest(tmp_path):
             },
         )
         assert response.json()["status"] == "accepted"
+        assert manager._question_resume_tasks == set()
         types = _drain(ws)
         assert "turn_done" in types
 

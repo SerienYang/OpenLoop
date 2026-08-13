@@ -782,8 +782,8 @@ class SessionManager:
         ok = self.inbox.resolve(item_id, resolution)
         if not ok or item is None:
             return ok
-        if not self.is_running(item.session_id):
-            await self._durable_resume(item)
+        if item.tool_call_id and self.try_mark_running(item.session_id):
+            await self._run_claimed_durable_resume(item)
         return ok
 
     async def resolve_question(
@@ -829,19 +829,27 @@ class SessionManager:
         )
         item = result.item
         if result.status == "accepted" and item is not None:
-            if not self.is_running(item.session_id):
-                await self._durable_resume(item)
-            await self.broadcast_session(
-                item.session_id,
-                {
-                    "type": "question_resolved",
-                    "data": {
-                        "item_id": item.id,
-                        "response_id": response_id,
-                        "status": result.status,
+            resume_gate = None
+            if item.tool_call_id and self.try_mark_running(item.session_id):
+                resume_gate = asyncio.Event()
+                self._schedule_question_resume(
+                    item, owns_claim=True, start_after=resume_gate
+                )
+            try:
+                await self.broadcast_session(
+                    item.session_id,
+                    {
+                        "type": "question_resolved",
+                        "data": {
+                            "item_id": item.id,
+                            "response_id": response_id,
+                            "status": result.status,
+                        },
                     },
-                },
-            )
+                )
+            finally:
+                if resume_gate is not None:
+                    resume_gate.set()
         return {
             "status": result.status,
             "item_id": item_id,
@@ -849,21 +857,74 @@ class SessionManager:
             **({"error": result.error} if result.error else {}),
         }
 
+    def _start_question_task(
+        self, coroutine: Any, *, description: str
+    ) -> asyncio.Task:
+        task = asyncio.get_running_loop().create_task(coroutine)
+        self._question_resume_tasks.add(task)
+        task.add_done_callback(
+            lambda completed: self._question_task_done(completed, description)
+        )
+        return task
+
+    def _question_task_done(
+        self, task: asyncio.Task, description: str
+    ) -> None:
+        self._question_resume_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            logger.exception("%s failed", description)
+
+    def _schedule_question_resume(
+        self,
+        item,
+        *,
+        owns_claim: bool = False,
+        start_after: Optional[asyncio.Event] = None,
+    ) -> Optional[asyncio.Task]:
+        if not getattr(item, "tool_call_id", None):
+            return None
+        if not owns_claim and not self.try_mark_running(item.session_id):
+            return None
+        coroutine = self._run_claimed_durable_resume(item, start_after=start_after)
+        try:
+            return self._start_question_task(
+                coroutine,
+                description=(
+                    "durable question resume "
+                    f"for session {item.session_id} item {item.id}"
+                ),
+            )
+        except BaseException:
+            coroutine.close()
+            self.mark_idle(item.session_id)
+            raise
+
+    async def _run_claimed_durable_resume(
+        self, item, *, start_after: Optional[asyncio.Event] = None
+    ) -> None:
+        """Run and release a resume claim acquired by the caller."""
+        try:
+            if start_after is not None:
+                await start_after.wait()
+            await self.broadcast_running_state()
+            await self._durable_resume(item)
+        finally:
+            self.mark_idle(item.session_id)
+            await self.broadcast_running_state()
+
     async def _durable_resume(self, item) -> None:
         if not getattr(item, "tool_call_id", None):
             return  # nothing to reconstruct (legacy item) — best-effort: leave it
         engine = self.get_engine(item.session_id)
         if engine is None or not hasattr(engine, "resume"):
             return
-        self.mark_running(item.session_id)
-        await self.broadcast_running_state()
-        try:
-            async for _event in engine.resume():
-                pass
-            self.save(item.session_id, engine)
-        finally:
-            self.mark_idle(item.session_id)
-            await self.broadcast_running_state()
+        async for _event in engine.resume():
+            pass
+        self.save(item.session_id, engine)
 
     async def reconcile_question_answers(self) -> None:
         """Finish or clean up accepted answers left between Pending and session checkpoints."""
@@ -946,12 +1007,10 @@ class SessionManager:
         for item in unconsumed:
             if item.id in checkpointed_items or item.id in blocked_items:
                 continue
-            if item.tool_call_id and not self.is_running(item.session_id):
+            if item.tool_call_id:
                 resume_by_session.setdefault(item.session_id, item)
         for item in resume_by_session.values():
-            task = asyncio.create_task(self._durable_resume(item))
-            self._question_resume_tasks.add(task)
-            task.add_done_callback(self._question_resume_tasks.discard)
+            self._schedule_question_resume(item)
 
     # -- MCP --------------------------------------------------------------------
     async def prepare_mcp_tools(
@@ -3086,16 +3145,18 @@ class SessionManager:
                     actor_id=str(getattr(source, "user_id", "") or ""),
                     answer=resolution,
                 )
-                task = asyncio.get_running_loop().create_task(
+                self._start_question_task(
                     self.resolve_question(
                         item_id,
                         expected_session_id=item.session_id,
                         response_id=response_id,
                         answer=resolution,
-                    )
+                    ),
+                    description=(
+                        "connector question resolution "
+                        f"for session {item.session_id} item {item.id}"
+                    ),
                 )
-                self._question_resume_tasks.add(task)
-                task.add_done_callback(self._question_resume_tasks.discard)
                 return True
             return self.inbox.resolve(item_id, resolution)
 

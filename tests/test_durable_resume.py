@@ -90,6 +90,7 @@ def test_durable_resume_question(tmp_path):
         item = await _run_until_pending(mgr, sid, engine)
         assert item.kind == "question" and item.tool_call_id == "call_q"
         await mgr.resolve_inbox(item.id, "us-west-2")  # restart-style resume
+        await asyncio.gather(*list(mgr._question_resume_tasks))
 
     asyncio.run(scenario())
     assert any("us-west-2" in (t or "") for t in _final_assistant_texts(mgr, sid))
@@ -126,6 +127,56 @@ def test_reconcile_resumes_accepted_question_not_yet_checkpointed(tmp_path):
     asyncio.run(scenario())
     assert any("Recovered" in (t or "") for t in _final_assistant_texts(mgr, sid))
     resolved = mgr.inbox.list(session_id=sid)[0]
+    assert "answer_content" not in resolved.data
+    assert resolved.data["answer_consumed_at"]
+
+
+def test_question_resume_claim_failure_preserves_owner_and_reconcile_retries(tmp_path):
+    mgr = SessionManager(
+        workspace=tmp_path,
+        provider=ScriptedProvider(
+            [
+                _tool("ask_user", {"question": "Which region?"}, "call_q"),
+                _text("Recovered after the competing turn."),
+            ]
+        ),
+    )
+    sid = "dur-claim-owner"
+
+    async def scenario():
+        engine = mgr.get_engine(sid, agent="openloop", workspace=str(tmp_path))
+        item = await _run_until_pending(mgr, sid, engine)
+        result = mgr.inbox.resolve_question(
+            item.id,
+            expected_session_id=sid,
+            response_id="response-1",
+            resolution="us-west-2",
+            answer_content="us-west-2",
+            answer_display={"text": "us-west-2", "attachments": []},
+        )
+        assert result.status == "accepted"
+
+        mgr.mark_running(sid)
+        failed_resume = mgr._schedule_question_resume(item)
+        if failed_resume is not None:
+            await asyncio.wait_for(failed_resume, timeout=1)
+
+        assert failed_resume is None
+        assert mgr.is_running(sid) is True
+        assert "answer_content" in mgr.inbox.get(item.id).data
+
+        mgr.mark_idle(sid)
+        await mgr.reconcile_question_answers()
+        resume_tasks = list(mgr._question_resume_tasks)
+        assert len(resume_tasks) == 1
+        await asyncio.wait_for(asyncio.gather(*resume_tasks), timeout=1)
+
+    asyncio.run(scenario())
+
+    assert any(
+        "Recovered after" in (text or "") for text in _final_assistant_texts(mgr, sid)
+    )
+    resolved = mgr.inbox.get(mgr.inbox.list(session_id=sid)[0].id)
     assert "answer_content" not in resolved.data
     assert resolved.data["answer_consumed_at"]
 
