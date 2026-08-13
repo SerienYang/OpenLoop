@@ -24,7 +24,11 @@ KIND_EVENT = "event"  # wake when a named connector/webhook event fires (Phase 3
 
 STATE_PENDING = "pending"
 STATE_DUE = "due"
+STATE_CLAIMED = "claimed"
 STATE_FIRED = "fired"
+SELFWAKE_TOOL_NAMES = frozenset(
+    {"sleep_for", "sleep_until", "wake_on", "wake_on_event"}
+)
 
 
 def _now() -> datetime:
@@ -54,6 +58,15 @@ class WakeStore:
                 "wakes", []
             ):
                 w = Wake(**raw)
+                if w.state == STATE_CLAIMED:
+                    w.state = STATE_PENDING if w.kind == KIND_TIMER else STATE_DUE
+                if w.state != STATE_FIRED:
+                    for wake_id, existing in list(self._wakes.items()):
+                        if (
+                            existing.session_id == w.session_id
+                            and existing.state != STATE_FIRED
+                        ):
+                            del self._wakes[wake_id]
                 self._wakes[w.id] = w
 
     def _save(self) -> None:
@@ -65,6 +78,18 @@ class WakeStore:
             encoding="utf-8",
         )
 
+    def _replace_active(self, wake: Wake) -> Wake:
+        with self._lock:
+            for wake_id, existing in list(self._wakes.items()):
+                if (
+                    existing.session_id == wake.session_id
+                    and existing.state != STATE_FIRED
+                ):
+                    del self._wakes[wake_id]
+            self._wakes[wake.id] = wake
+            self._save()
+        return wake
+
     def add_timer(self, session_id: str, fire_at: datetime, *, note: str = "") -> Wake:
         w = Wake(
             uuid.uuid4().hex,
@@ -73,45 +98,46 @@ class WakeStore:
             fire_at=fire_at.isoformat(),
             note=note,
         )
-        with self._lock:
-            self._wakes[w.id] = w
-            self._save()
-        return w
+        return self._replace_active(w)
 
     def add_completion(self, session_id: str, job_id: str, *, note: str = "") -> Wake:
         w = Wake(
             uuid.uuid4().hex, session_id, KIND_COMPLETION, job_id=job_id, note=note
         )
-        with self._lock:
-            self._wakes[w.id] = w
-            self._save()
-        return w
+        return self._replace_active(w)
 
     def add_event(self, session_id: str, event_key: str, *, note: str = "") -> Wake:
         w = Wake(
             uuid.uuid4().hex, session_id, KIND_EVENT, event_key=event_key, note=note
         )
-        with self._lock:
-            self._wakes[w.id] = w
-            self._save()
-        return w
+        return self._replace_active(w)
 
     def due(self, now: Optional[datetime] = None) -> list[Wake]:
         """Timer wakes whose fire time has passed, plus completion/event wakes marked due."""
         now = now or _now()
-        out = []
-        for w in self._wakes.values():
-            if w.state != STATE_PENDING and w.state != STATE_DUE:
-                continue
-            if (
-                w.kind == KIND_TIMER
-                and w.fire_at
-                and datetime.fromisoformat(w.fire_at) <= now
-            ):
-                out.append(w)
-            elif w.kind in (KIND_COMPLETION, KIND_EVENT) and w.state == STATE_DUE:
-                out.append(w)
-        return out
+        with self._lock:
+            return [w for w in self._wakes.values() if self._is_due(w, now)]
+
+    def claim_due(self, now: Optional[datetime] = None) -> list[Wake]:
+        """Atomically reserve due wakes so concurrent ticks cannot deliver them twice."""
+        now = now or _now()
+        with self._lock:
+            claimed = [w for w in self._wakes.values() if self._is_due(w, now)]
+            for wake in claimed:
+                wake.state = STATE_CLAIMED
+            if claimed:
+                self._save()
+            return claimed
+
+    @staticmethod
+    def _is_due(wake: Wake, now: datetime) -> bool:
+        if wake.state not in (STATE_PENDING, STATE_DUE):
+            return False
+        if wake.kind == KIND_TIMER:
+            return bool(
+                wake.fire_at and datetime.fromisoformat(wake.fire_at) <= now
+            )
+        return wake.kind in (KIND_COMPLETION, KIND_EVENT) and wake.state == STATE_DUE
 
     def complete_job(self, job_id: str) -> list[Wake]:
         """Mark completion wakes for ``job_id`` as due (the job exited). Returns them."""
@@ -143,13 +169,22 @@ class WakeStore:
                 w.state = STATE_FIRED
                 self._save()
 
+    def release_claim(self, wake_id: str) -> None:
+        with self._lock:
+            wake = self._wakes.get(wake_id)
+            if wake is None or wake.state != STATE_CLAIMED:
+                return
+            wake.state = STATE_PENDING if wake.kind == KIND_TIMER else STATE_DUE
+            self._save()
+
     def pending(self, session_id: Optional[str] = None) -> list[Wake]:
-        return [
-            w
-            for w in self._wakes.values()
-            if w.state != STATE_FIRED
-            and (session_id is None or w.session_id == session_id)
-        ]
+        with self._lock:
+            return [
+                w
+                for w in self._wakes.values()
+                if w.state != STATE_FIRED
+                and (session_id is None or w.session_id == session_id)
+            ]
 
 
 def selfwake_tools(store: WakeStore, session_id: str) -> list:

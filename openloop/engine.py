@@ -24,6 +24,7 @@ from .events import Event, EventType
 from .permissions import Mode, PermissionEngine
 from .providers import AssistantTurn, ProviderClient, ToolCall
 from .providers.errors import friendly_model_error
+from .selfwake import SELFWAKE_TOOL_NAMES
 from .tools import ToolRegistry
 
 
@@ -125,6 +126,7 @@ class TurnEngine:
         self._standing_notes: dict[str, str] = {}
         self._interrupt_hooks: list[Callable[[], None]] = list(interrupt_hooks or [])
         self._message_rewrite_required = False
+        self._suspend_turn_requested = False
 
     # -- external controls ------------------------------------------------------
     def request_interrupt(self) -> None:
@@ -189,6 +191,7 @@ class TurnEngine:
             message["_display"] = display
         self.messages.append(message)
         self._cancel.clear()
+        self._suspend_turn_requested = False
         data: dict[str, Any] = {"input": user_input}
         if source is not None:
             data["source"] = source
@@ -285,9 +288,13 @@ class TurnEngine:
         ):
             yield event
         yield Event(EventType.ITERATION_END, {"iteration": 0})
-        if not self._cancel.is_set():
-            async for event in self._loop():
-                yield event
+        if self._cancel.is_set():
+            return
+        if self._should_suspend_after_tools():
+            yield Event(EventType.TURN_END, {"status": "suspended", "iterations": 0})
+            return
+        async for event in self._loop():
+            yield event
 
     def _unanswered_trailing_tool_calls(self) -> list[ToolCall]:
         """The tool-calls of the last assistant message that don't yet have a tool result —
@@ -452,8 +459,12 @@ class TurnEngine:
                 self._append_notice("interrupted")
                 yield Event(EventType.INTERRUPTED, {"iterations": iterations})
                 return
-            if self._steering:
-                self._inject_steering()
+            if self._should_suspend_after_tools():
+                yield Event(
+                    EventType.TURN_END,
+                    {"status": "suspended", "iterations": iterations},
+                )
+                return
 
     # -- auto-compaction (OPE-27) ------------------------------------------------
     def _compaction_config(self) -> dict[str, Any]:
@@ -878,6 +889,19 @@ class TurnEngine:
         except Exception as exc:
             return {"error": str(exc), "error_type": type(exc).__name__}, "error"
 
+    def _should_suspend_after_tools(self) -> bool:
+        if self._steering:
+            self._suspend_turn_requested = False
+            self._inject_steering()
+            return False
+        if self.messages and self.messages[-1].get("_question_response"):
+            self._suspend_turn_requested = False
+            return False
+        if not self._suspend_turn_requested:
+            return False
+        self._suspend_turn_requested = False
+        return True
+
     def _record_result(self, tool_call: ToolCall, result: Any, status: str) -> Event:
         # A `_display` key on a tool result is user-facing metadata the AGENT must
         # never see (e.g. how many gmail hits the privacy filters hid — a count
@@ -914,6 +938,8 @@ class TurnEngine:
             result=result,
             result_preview=_preview(result),
         )
+        if status == "ok" and tool_call.name in SELFWAKE_TOOL_NAMES:
+            self._suspend_turn_requested = True
         rule = self._standing_notes.pop(tool_call.id, "")
         return Event(
             EventType.TOOL_FINISHED,

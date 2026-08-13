@@ -3180,14 +3180,17 @@ class SessionManager:
         its own session with a wake message so it continues where it left off. Returns the count.
         """
         resumed = 0
-        for wake in self.wakes.due():
+        for wake in self.wakes.claim_due():
             try:
-                await self._resume_wake(wake)
-                resumed += 1
+                delivered = await self._resume_wake(wake)
             except Exception:
-                pass
-            finally:
-                self.wakes.mark_fired(wake.id)
+                self.wakes.release_claim(wake.id)
+            else:
+                if delivered is False:
+                    self.wakes.release_claim(wake.id)
+                else:
+                    self.wakes.mark_fired(wake.id)
+                    resumed += 1
         return resumed
 
     def mark_running(self, session_id: str) -> None:
@@ -3221,26 +3224,30 @@ class SessionManager:
             {"type": "running_state_changed", "data": self.running_state()}
         )
 
-    async def _resume_wake(self, wake) -> None:
-        await self.deliver_to_session(wake.session_id, self._wake_message(wake))
+    async def _resume_wake(self, wake) -> bool:
+        return await self.deliver_to_session(
+            wake.session_id, self._wake_message(wake)
+        )
 
     async def deliver_to_session(
         self, session_id: str, message: str, *, source: Optional[dict[str, Any]] = None
-    ) -> None:
+    ) -> bool:
         """Deliver an out-of-band message to a (durable) session — the agent stays resumable
         forever, so this works with no live socket. Busy (mid tool-loop): steer it into the live
         turn at its next step (don't start a colliding run). Idle: run a fresh background turn
         (results persist; if the session is Unattended, any approvals route to the Inbox). Shared
         by self-wake and channel-subscription delivery. `source` is the display-only MessageSource
-        sidecar for connector messages (framed `message` stays the model-facing text).
+        sidecar for connector messages (framed `message` stays the model-facing text). Returns
+        False only when the turn failed or its updated session could not be saved.
         """
         engine = self.get_engine(session_id)
         if engine is None:
-            return
+            return True
         if not self.try_mark_running(session_id):
             engine.queue_steering(message, source)
-            return
+            return True
         await self.broadcast_running_state()
+        failed = False
         try:
             async for event in engine.run(message, source=source):
                 # Stream every event to any socket viewing this session, so a background turn
@@ -3251,6 +3258,7 @@ class SessionManager:
                 # A background turn has no user watching to read an inline error: a dead model or
                 # tool failure would otherwise vanish. Log it and park it in the dead-letter store.
                 if event.type.value == "error":
+                    failed = True
                     reason = (event.data or {}).get("error", "unknown error")
                     logger.warning(
                         "background turn failed for %s: %s", session_id, reason
@@ -3260,6 +3268,7 @@ class SessionManager:
         except (
             Exception
         ) as exc:  # an unexpected raise out of the turn must not be swallowed
+            failed = True
             logger.warning("background turn crashed for %s: %s", session_id, exc)
             self.unrouted.record(session_id, "-", message, reason=str(exc))
             await self.broadcast_session(
@@ -3269,6 +3278,7 @@ class SessionManager:
             self.mark_idle(session_id)
             await self.broadcast_running_state()
             await self.broadcast_session(session_id, {"type": "turn_done", "data": {}})
+        return not failed
 
     # -- channel subscriptions (inbound messaging) ------------------------------
     async def _dispatch_inbound(self, event) -> None:
