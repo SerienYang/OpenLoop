@@ -15,7 +15,12 @@ import zlib
 
 import pytest
 
-from openloop.attachments import build_user_content, content_to_text
+from openloop.attachments import (
+    MAX_TEXT_CHARS,
+    build_user_content,
+    content_to_text,
+    validate_attachments,
+)
 
 
 # -- a tiny solid-color PNG (stdlib) so tests need no fixtures -------------------
@@ -85,6 +90,34 @@ def test_invalid_and_oversized_attachments_are_skipped():
     ]
     # only the leading text survives → falls back to the plain string
     assert build_user_content("hi", bad) == "hi"
+
+
+def test_attachment_validation_rejects_invalid_payloads_instead_of_dropping_them():
+    bad = [
+        {"kind": "image", "data_url": "https://example.com/not-a-data-url"},
+        {"kind": "pdf", "data_url": "data:image/png;base64,AA=="},
+        {"kind": "text", "text": "x" * (MAX_TEXT_CHARS + 1)},
+    ]
+
+    for attachment in bad:
+        result = validate_attachments([attachment])
+        assert result.error
+        assert result.attachments == []
+
+
+def test_attachment_validation_accepts_supported_question_answer_payloads():
+    image = {"kind": "image", "name": "frame.png", "data_url": _data_url(1, 2, 3)}
+    pdf = {
+        "kind": "pdf",
+        "name": "brief.pdf",
+        "data_url": "data:application/pdf;base64,JVBERi0xLjQ=",
+    }
+    text = {"kind": "text", "name": "notes.md", "text": "# Notes"}
+
+    result = validate_attachments([image, pdf, text])
+
+    assert result.error is None
+    assert result.attachments == [image, pdf, text]
 
 
 def test_content_to_text_flattens_parts():

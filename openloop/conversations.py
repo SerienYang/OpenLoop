@@ -143,6 +143,22 @@ class ConversationStore:
             for m in messages:
                 f.write(json.dumps(m) + "\n")
 
+    def replace_messages(self, sid: str, messages: list[dict]) -> None:
+        """Atomically rewrite a session when persisted recovery sidecars were consumed."""
+        with self._lock:
+            path = self._file(sid)
+            temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                with open(temp, "w", encoding="utf-8") as handle:
+                    for message in messages:
+                        handle.write(json.dumps(message) + "\n")
+                os.replace(temp, path)
+            finally:
+                try:
+                    temp.unlink()
+                except FileNotFoundError:
+                    pass
+
     def _backfill_counts(self) -> None:
         """One-time per session: move any inline blob into a .jsonl and persist
         title + n_msgs in the index. Skips already-migrated rows on later startups."""

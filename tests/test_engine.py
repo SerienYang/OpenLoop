@@ -290,6 +290,115 @@ def test_non_low_risk_tool_calls_stay_sequential(tmp_path):
     assert order == ["first-start", "first-end", "second-start", "second-end"]
 
 
+def test_question_answer_is_injected_after_all_tool_results(tmp_path):
+    (tmp_path / "reference.txt").write_text("reference", encoding="utf-8")
+    answer_content = [
+        {"type": "text", "text": "Use the attached frame"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,AA=="},
+        },
+    ]
+    engine, _ = _engine(
+        tmp_path,
+        [
+            _multi_tool_turn(
+                [
+                    ("ask_user", {"question": "Which reference?"}),
+                    ("read_file", {"path": "reference.txt"}),
+                ]
+            ),
+            _text_turn("continued"),
+        ],
+    )
+
+    async def answer(_args, _tool_call_id=None):
+        return {
+            "accepted": True,
+            "answer": "Use the attached frame",
+            "content": answer_content,
+            "item_id": "question-1",
+            "session_id": "s1",
+            "response_id": "response-1",
+            "response_digest": "sha256:digest",
+            "display": {
+                "text": "Use the attached frame",
+                "attachments": [{"kind": "image", "name": "frame.png"}],
+            },
+        }
+
+    engine.question_asker = answer
+    _collect(engine, "go")
+
+    roles = [message["role"] for message in engine.messages]
+    assistant_index = roles.index("assistant")
+    answer_index = next(
+        index
+        for index, message in enumerate(engine.messages)
+        if message.get("_question_response")
+    )
+    tool_indexes = [
+        index
+        for index, message in enumerate(engine.messages)
+        if index > assistant_index and message["role"] == "tool"
+    ]
+    assert len(tool_indexes) == 2
+    assert max(tool_indexes) < answer_index
+    assert engine.messages[answer_index]["content"] == answer_content
+    assert engine.messages[answer_index]["_question_response"] == [
+        {
+            "session_id": "s1",
+            "item_id": "question-1",
+            "response_id": "response-1",
+            "response_digest": "sha256:digest",
+        }
+    ]
+    assert "data:image/" not in str(
+        engine.messages[answer_index]["_question_answer_display"]
+    )
+    assert all(
+        "data:image/" not in str(message.get("content"))
+        for message in engine.messages
+        if message.get("role") == "tool"
+    )
+
+
+def test_text_attachment_only_question_answer_keeps_content_parts(tmp_path):
+    engine, _ = _engine(
+        tmp_path,
+        [_tool_turn("ask_user", {"question": "Attach notes"}), _text_turn("done")],
+    )
+
+    async def answer(_args, _tool_call_id=None):
+        return {
+            "accepted": True,
+            "answer": "[1 text]",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "[Attached file: notes.md]\n# Notes",
+                }
+            ],
+            "item_id": "question-text",
+            "session_id": "s1",
+            "response_id": "response-text",
+            "response_digest": "sha256:text",
+            "display": {
+                "text": "",
+                "attachments": [{"kind": "text", "name": "notes.md"}],
+            },
+        }
+
+    engine.question_asker = answer
+    _collect(engine, "go")
+
+    message = next(
+        item for item in engine.messages if item.get("_question_response")
+    )
+    assert isinstance(message["content"], list)
+    assert message["content"][0]["text"].startswith("[Attached file: notes.md]")
+
+
 class StreamingProvider(ProviderClient):
     def complete(self, **kwargs):  # pragma: no cover - streamed instead
         raise NotImplementedError

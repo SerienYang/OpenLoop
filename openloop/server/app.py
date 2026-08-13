@@ -51,18 +51,6 @@ _WS_MAX_FRAME_BYTES = 16 * 1024 * 1024
 _WS_RATE_LIMIT_COUNT = 30
 _WS_RATE_LIMIT_WINDOW_SECONDS = 10.0
 _MAX_MESSAGE_TEXT_CHARS = 200_000
-_MAX_ATTACHMENTS_BYTES = 15_000_000  # leaves JSON overhead below the 16 MiB frame cap
-
-
-def _json_value_size(value: Any) -> int:
-    """Conservative UTF-8 size of parsed JSON without allocating another giant string."""
-    if isinstance(value, str):
-        return len(value.encode("utf-8"))
-    if isinstance(value, dict):
-        return sum(_json_value_size(k) + _json_value_size(v) for k, v in value.items())
-    if isinstance(value, list):
-        return sum(_json_value_size(v) for v in value)
-    return 8  # numbers, booleans, null, separators
 
 
 # Brand colors for the connector badge riding the ✓ (UX-DECISIONS §30). The GUI owns the
@@ -138,10 +126,8 @@ def _browser_page(
 
 from ..attachments import (
     MAX_ATTACHMENTS as _MAX_ATTACHMENTS,
-    MAX_IMAGE_CHARS,
-    MAX_PDF_CHARS,
-    MAX_TEXT_CHARS,
     build_user_content,
+    validate_attachments,
 )
 from ..engine import ApprovalOutcome
 from ..permissions import Mode
@@ -153,6 +139,7 @@ from .manager import SessionManager
 def create_app(manager: SessionManager) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        await manager.reconcile_question_answers()
         try:
             live = (
                 await manager.start_gateway()
@@ -283,8 +270,27 @@ def create_app(manager: SessionManager) -> FastAPI:
     async def resolve_pending_item(item_id: str, body: dict) -> dict[str, Any]:
         # Idempotent + first-responder-wins: ok=False means it was already resolved elsewhere.
         # Routes through resolve_pending so a restart-orphaned prompt durably resumes its turn.
+        item = manager.pending.get(item_id)
+        if item is not None and item.kind == "question":
+            raise HTTPException(
+                status_code=400,
+                detail="questions must use the question resolution endpoint",
+            )
         ok = await manager.resolve_inbox(item_id, str(body.get("resolution", "deny")))
         return {"ok": ok}
+
+    @app.post("/v1/pending/{item_id}/resolve-question")
+    async def resolve_question_item(item_id: str, body: dict) -> dict[str, Any]:
+        result = await manager.resolve_question(
+            item_id,
+            expected_session_id=str(body.get("session_id", "")),
+            response_id=str(body.get("response_id", "")),
+            answer=str(body.get("answer", "")),
+            attachments=body.get("attachments"),
+        )
+        if result["status"] in {"rejected", "response_conflict"}:
+            raise HTTPException(status_code=400, detail=result)
+        return result
 
     @app.get("/v1/subscriptions")
     def subscriptions() -> dict[str, Any]:
@@ -1186,6 +1192,12 @@ def create_app(manager: SessionManager) -> FastAPI:
                 manager.persist_session(
                     session_id
                 )  # the pending tool call is now on disk
+                await ws.send_json(
+                    {
+                        "type": "pending_registered",
+                        "data": {"id": item.id, "kind": "approval"},
+                    }
+                )
                 if item.visibility == VIS_INBOX:
                     await _mirror(item)
             resolution = await manager.inbox.wait(item.id)
@@ -1214,6 +1226,7 @@ def create_app(manager: SessionManager) -> FastAPI:
                         {
                             "type": "question_requested",
                             "data": {
+                                "id": item.id,
                                 "question": item.title,
                                 "options": item.options,
                                 "allow_text": item.allow_text,
@@ -1222,7 +1235,12 @@ def create_app(manager: SessionManager) -> FastAPI:
                             },
                         }
                     )
-            return {"answer": await manager.inbox.wait(item.id)}
+            await manager.inbox.wait(item.id)
+            return manager.inbox.question_answer(item.id) or {
+                "accepted": True,
+                "answer": item.resolution or "",
+                "content": item.resolution or "",
+            }
 
         async def directory_requester(args: dict, tool_call_id=None) -> dict:
             # The engine has already emitted DIRECTORY_REQUESTED. Park, await, then apply the grant.
@@ -1240,6 +1258,12 @@ def create_app(manager: SessionManager) -> FastAPI:
             )
             if item.state == "pending":
                 manager.persist_session(session_id)
+                await ws.send_json(
+                    {
+                        "type": "pending_registered",
+                        "data": {"id": item.id, "kind": "directory"},
+                    }
+                )
                 if item.visibility == VIS_INBOX:
                     await _mirror(item)
             resp = _parse_json(
@@ -1285,6 +1309,12 @@ def create_app(manager: SessionManager) -> FastAPI:
             )
             if item.state == "pending":
                 manager.persist_session(session_id)
+                await ws.send_json(
+                    {
+                        "type": "pending_registered",
+                        "data": {"id": item.id, "kind": "plan"},
+                    }
+                )
                 if item.visibility == VIS_INBOX:
                     await _mirror(item)
             resp = _parse_json(
@@ -1315,12 +1345,19 @@ def create_app(manager: SessionManager) -> FastAPI:
                 {"type": "model_changed", "data": {"model": model, "text": notice}},
             )
 
-        def _resolve_pending(resolution: str) -> None:
-            # Live WS responses resolve THE session's single pending prompt (one at a time, since the
-            # agent blocks). Reconnect / Inbox resolve by id via REST instead.
-            pend = manager.inbox.pending(session_id)
-            if pend:
-                manager.inbox.resolve(pend[0].id, resolution)
+        def _resolve_pending(
+            item_id: str, resolution: str, expected_kind: str
+        ) -> None:
+            # Legacy typed frames may resolve only their own prompt kind. They must never
+            # consume a question, which requires item/session/response ids and a digest.
+            item = manager.inbox.get(item_id)
+            if (
+                item is not None
+                and item.session_id == session_id
+                and item.kind == expected_kind
+                and item.state == "pending"
+            ):
+                manager.inbox.resolve(item.id, resolution)
 
         workspace = ws.query_params.get("workspace")
         project_id = ws.query_params.get("project_id") or None
@@ -1460,29 +1497,45 @@ def create_app(manager: SessionManager) -> FastAPI:
                     await reject_input("Invalid WebSocket message: missing string type.")
                     continue
                 if kind == "approval":
-                    _resolve_pending(message.get("decision", "deny"))
+                    _resolve_pending(
+                        str(message.get("item_id", "")),
+                        message.get("decision", "deny"),
+                        "approval",
+                    )
                 elif kind == "directory_response":
                     _resolve_pending(
+                        str(message.get("item_id", "")),
                         json.dumps(
                             {
                                 "granted": bool(message.get("granted")),
                                 "path": message.get("path", ""),
                                 "writable": bool(message.get("writable", False)),
                             }
-                        )
+                        ),
+                        "directory",
                     )
                 elif kind == "plan_response":
                     _resolve_pending(
+                        str(message.get("item_id", "")),
                         json.dumps(
                             {
                                 "approved": bool(message.get("approved")),
                                 "mode": message.get("mode", "interactive"),
                                 "feedback": message.get("feedback", ""),
                             }
-                        )
+                        ),
+                        "plan",
                     )
                 elif kind == "question_response":
-                    _resolve_pending(str(message.get("answer", "")))
+                    result = await manager.resolve_question(
+                        str(message.get("item_id", "")),
+                        expected_session_id=str(message.get("session_id", "")),
+                        response_id=str(message.get("response_id", "")),
+                        answer=str(message.get("answer", "")),
+                        attachments=message.get("attachments"),
+                    )
+                    if result["status"] in {"rejected", "response_conflict"}:
+                        await reject_input(str(result.get("error") or result["status"]))
                 elif kind == "interrupt":
                     engine.request_interrupt()
                 elif kind == "retry":
@@ -1508,74 +1561,17 @@ def create_app(manager: SessionManager) -> FastAPI:
                         await reject_input("Invalid message text: expected a string.")
                         continue
                     text = raw_text.strip()
-                    raw_attachments = message.get("attachments")
-                    attachments = [] if raw_attachments is None else raw_attachments
-                    # Reject an oversized frame instead of buffering it into a turn. Send a
-                    # visible error so the surface can tell the user, and drop the message.
-                    if not isinstance(attachments, list):
-                        await reject_input("Invalid attachments: expected a list.")
-                        continue
-                    reject = None
                     if len(text) > _MAX_MESSAGE_TEXT_CHARS:
-                        reject = (
+                        await reject_input(
                             f"Message too long ({len(text)} chars; "
                             f"limit {_MAX_MESSAGE_TEXT_CHARS})."
                         )
-                    elif len(attachments) > _MAX_ATTACHMENTS:
-                        reject = (
-                            f"Too many attachments ({len(attachments)}; "
-                            f"limit {_MAX_ATTACHMENTS})."
-                        )
-                    elif any(not isinstance(a, dict) for a in attachments):
-                        reject = "Invalid attachment: expected an object."
-                    elif _json_value_size(attachments) > _MAX_ATTACHMENTS_BYTES:
-                        reject = "Attachments too large (limit 15 MB per message)."
-                    else:
-                        for attachment in attachments:
-                            attachment_kind = attachment.get("kind")
-                            name = attachment.get("name")
-                            mime = attachment.get("mime")
-                            if attachment_kind not in {"image", "pdf", "text"}:
-                                reject = "Invalid attachment kind."
-                            elif name is not None and (
-                                not isinstance(name, str) or len(name) > 1024
-                            ):
-                                reject = "Invalid attachment name."
-                            elif mime is not None and (
-                                not isinstance(mime, str) or len(mime) > 255
-                            ):
-                                reject = "Invalid attachment MIME type."
-                            elif attachment_kind == "image":
-                                data = attachment.get("data_url")
-                                if (
-                                    not isinstance(data, str)
-                                    or not data.startswith("data:image/")
-                                    or ";base64," not in data
-                                    or len(data) > MAX_IMAGE_CHARS
-                                ):
-                                    reject = "Invalid or oversized image attachment."
-                            elif attachment_kind == "pdf":
-                                data = attachment.get("data_url")
-                                if (
-                                    not isinstance(data, str)
-                                    or not data.startswith(
-                                        "data:application/pdf;base64,"
-                                    )
-                                    or len(data) > MAX_PDF_CHARS
-                                ):
-                                    reject = "Invalid or oversized PDF attachment."
-                            else:
-                                body = attachment.get("text")
-                                if (
-                                    not isinstance(body, str)
-                                    or len(body) > MAX_TEXT_CHARS
-                                ):
-                                    reject = "Invalid or oversized text attachment."
-                            if reject is not None:
-                                break
-                    if reject is not None:
-                        await reject_input(reject)
                         continue
+                    checked = validate_attachments(message.get("attachments"))
+                    if checked.error is not None:
+                        await reject_input(checked.error)
+                        continue
+                    attachments = checked.attachments
                     # The composer sends its visible model with every message — the FIRST
                     # one binds the session (race-proof across reconnects; see api.ts
                     # Session.userMessage), later ones may switch it (notice persisted).

@@ -12,12 +12,32 @@ text-only path), else the parts list.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Optional
 
 MAX_ATTACHMENTS = 8
+MAX_ATTACHMENTS_BYTES = 15_000_000
 MAX_IMAGE_CHARS = 12_000_000  # data-URL length cap (~8–9 MB decoded); keeps a turn sane
 MAX_PDF_CHARS = 15_000_000  # data-URL length cap (~10 MB decoded, the GUI's pick limit)
 MAX_TEXT_CHARS = 200_000  # per text file, inlined
+MAX_NAME_CHARS = 1024
+MAX_MIME_CHARS = 255
+
+
+@dataclass(frozen=True)
+class AttachmentValidation:
+    attachments: list[dict[str, Any]]
+    error: Optional[str] = None
+
+
+def _json_value_size(value: Any) -> int:
+    if isinstance(value, str):
+        return len(value.encode("utf-8"))
+    if isinstance(value, dict):
+        return sum(_json_value_size(k) + _json_value_size(v) for k, v in value.items())
+    if isinstance(value, list):
+        return sum(_json_value_size(v) for v in value)
+    return 8
 
 
 def _is_data_image(url: Any) -> bool:
@@ -26,6 +46,68 @@ def _is_data_image(url: Any) -> bool:
 
 def _is_data_pdf(url: Any) -> bool:
     return isinstance(url, str) and url.startswith("data:application/pdf;base64,")
+
+
+def validate_attachments(value: Any) -> AttachmentValidation:
+    """Validate the shared wire shape used by user messages and question answers."""
+    if value is None:
+        return AttachmentValidation([])
+    if not isinstance(value, list):
+        return AttachmentValidation([], "Invalid attachments: expected a list.")
+    if len(value) > MAX_ATTACHMENTS:
+        return AttachmentValidation(
+            [], f"Too many attachments ({len(value)}; limit {MAX_ATTACHMENTS})."
+        )
+    if _json_value_size(value) > MAX_ATTACHMENTS_BYTES:
+        return AttachmentValidation(
+            [], "Attachments too large (limit 15 MB per message)."
+        )
+
+    attachments: list[dict[str, Any]] = []
+    for attachment in value:
+        if not isinstance(attachment, dict):
+            return AttachmentValidation([], "Invalid attachment: expected an object.")
+        kind = attachment.get("kind")
+        name = attachment.get("name")
+        mime = attachment.get("mime")
+        if kind not in {"image", "pdf", "text"}:
+            return AttachmentValidation([], "Invalid attachment kind.")
+        if name is not None and (
+            not isinstance(name, str) or len(name) > MAX_NAME_CHARS
+        ):
+            return AttachmentValidation([], "Invalid attachment name.")
+        if mime is not None and (
+            not isinstance(mime, str) or len(mime) > MAX_MIME_CHARS
+        ):
+            return AttachmentValidation([], "Invalid attachment MIME type.")
+        if kind == "image":
+            data = attachment.get("data_url")
+            if (
+                not _is_data_image(data)
+                or not isinstance(data, str)
+                or len(data) > MAX_IMAGE_CHARS
+            ):
+                return AttachmentValidation(
+                    [], "Invalid or oversized image attachment."
+                )
+        elif kind == "pdf":
+            data = attachment.get("data_url")
+            if (
+                not _is_data_pdf(data)
+                or not isinstance(data, str)
+                or len(data) > MAX_PDF_CHARS
+            ):
+                return AttachmentValidation(
+                    [], "Invalid or oversized PDF attachment."
+                )
+        else:
+            body = attachment.get("text")
+            if not isinstance(body, str) or not body or len(body) > MAX_TEXT_CHARS:
+                return AttachmentValidation(
+                    [], "Invalid or oversized text attachment."
+                )
+        attachments.append(dict(attachment))
+    return AttachmentValidation(attachments)
 
 
 def build_user_content(

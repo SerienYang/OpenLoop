@@ -14,13 +14,16 @@ suspends the agent until that item is resolved.
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import json
+import os
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 KIND_APPROVAL = "approval"
 KIND_QUESTION = "question"
@@ -120,6 +123,29 @@ class InboxItem:
     data: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class QuestionResolutionResult:
+    status: Literal[
+        "accepted",
+        "accepted_replay",
+        "response_conflict",
+        "already_resolved",
+        "rejected",
+    ]
+    item: Optional[InboxItem] = None
+    error: Optional[str] = None
+
+
+def _answer_digest(answer_content: Any) -> str:
+    payload = json.dumps(
+        answer_content,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
 class InboxStore:
     def __init__(self, path: Optional[str | Path] = None) -> None:
         self.path = Path(path) if path else None
@@ -139,13 +165,24 @@ class InboxStore:
                 self._items[item.id] = item
 
     def _save(self) -> None:
+        self._save_items(self._items)
+
+    def _save_items(self, items: dict[str, InboxItem]) -> None:
         if not self.path:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps({"items": [asdict(i) for i in self._items.values()]}, indent=2),
-            encoding="utf-8",
-        )
+        temp = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temp.write_text(
+                json.dumps({"items": [asdict(i) for i in items.values()]}, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(temp, self.path)
+        finally:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
 
     # -- adding -----------------------------------------------------------------
     def add(
@@ -342,6 +379,123 @@ class InboxStore:
         if waiter is not None:
             waiter.set()
         return True
+
+    def resolve_question(
+        self,
+        item_id: str,
+        *,
+        expected_session_id: str,
+        response_id: str,
+        resolution: str,
+        answer_content: Any,
+        answer_display: Optional[dict[str, Any]] = None,
+    ) -> QuestionResolutionResult:
+        if not expected_session_id or not response_id:
+            return QuestionResolutionResult(
+                "rejected", error="session_id and response_id are required"
+            )
+        digest = _answer_digest(answer_content)
+        with self._lock:
+            current = self._items.get(item_id)
+            if current is None:
+                return QuestionResolutionResult("rejected", error="question not found")
+            if current.session_id != expected_session_id:
+                return QuestionResolutionResult("rejected", error="session mismatch")
+            if current.kind != KIND_QUESTION:
+                return QuestionResolutionResult("rejected", error="item is not a question")
+            prior_id = str(current.data.get("response_id") or "")
+            prior_digest = str(current.data.get("response_digest") or "")
+            if current.state == STATE_RESOLVED:
+                if prior_id == response_id:
+                    status = (
+                        "accepted_replay"
+                        if prior_digest == digest
+                        else "response_conflict"
+                    )
+                    return QuestionResolutionResult(status, item=current)
+                return QuestionResolutionResult("already_resolved", item=current)
+
+            candidate = copy.deepcopy(current)
+            candidate.state = STATE_RESOLVED
+            candidate.resolution = resolution
+            candidate.resolved_at = _now()
+            candidate.data.update(
+                {
+                    "response_id": response_id,
+                    "response_digest": digest,
+                    "answer_content": copy.deepcopy(answer_content),
+                    "answer_display": copy.deepcopy(answer_display or {}),
+                }
+            )
+            candidate_items = dict(self._items)
+            candidate_items[item_id] = candidate
+            self._save_items(candidate_items)
+            self._items = candidate_items
+
+        waiter = self._waiters.get(item_id)
+        if waiter is not None:
+            waiter.set()
+        return QuestionResolutionResult("accepted", item=candidate)
+
+    def question_answer(self, item_id: str) -> Optional[dict[str, Any]]:
+        item = self._items.get(item_id)
+        if item is None or item.kind != KIND_QUESTION or item.state != STATE_RESOLVED:
+            return None
+        content = item.data.get("answer_content")
+        if content is None:
+            content = item.resolution or ""
+        return {
+            "answer": item.resolution or "",
+            "content": copy.deepcopy(content),
+            "response_id": str(item.data.get("response_id") or ""),
+            "response_digest": str(item.data.get("response_digest") or ""),
+            "display": copy.deepcopy(item.data.get("answer_display") or {}),
+            "item_id": item.id,
+            "session_id": item.session_id,
+        }
+
+    def mark_question_answer_consumed(
+        self, item_id: str, *, response_id: str, response_digest: str
+    ) -> bool:
+        return self.mark_question_answers_consumed(
+            [
+                {
+                    "item_id": item_id,
+                    "response_id": response_id,
+                    "response_digest": response_digest,
+                }
+            ]
+        )
+
+    def mark_question_answers_consumed(
+        self, entries: list[dict[str, str]]
+    ) -> bool:
+        if not entries:
+            return False
+        with self._lock:
+            currents: list[InboxItem] = []
+            for entry in entries:
+                current = self._items.get(entry.get("item_id", ""))
+                if (
+                    current is None
+                    or current.kind != KIND_QUESTION
+                    or current.data.get("response_id") != entry.get("response_id")
+                    or current.data.get("response_digest")
+                    != entry.get("response_digest")
+                ):
+                    return False
+                currents.append(current)
+            candidate_items = dict(self._items)
+            consumed_at = _now()
+            for current in currents:
+                candidate = copy.deepcopy(current)
+                candidate.data.pop("answer_content", None)
+                candidate.data.pop("answer_display", None)
+                candidate.data["answer_consumed_at"] = consumed_at
+                candidate_items[current.id] = candidate
+            self._save_items(candidate_items)
+            self._items = candidate_items
+            return True
 
     def resolve_session(
         self, session_id: str, resolution: str = "session deleted"

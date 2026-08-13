@@ -17,6 +17,7 @@ from .inbox import (
     VIS_INLINE,
     InboxItem as PendingItem,
     InboxStore as _LegacyStore,
+    QuestionResolutionResult,
     args_preview,
 )
 
@@ -106,6 +107,18 @@ class PendingStore:
 
     def resolve(self, item_id: str, resolution: str) -> bool:
         return self._store.resolve(item_id, resolution)
+
+    def resolve_question(self, *args, **kwargs) -> QuestionResolutionResult:
+        return self._store.resolve_question(*args, **kwargs)
+
+    def question_answer(self, item_id: str) -> Optional[dict[str, Any]]:
+        return self._store.question_answer(item_id)
+
+    def mark_question_answer_consumed(self, *args, **kwargs) -> bool:
+        return self._store.mark_question_answer_consumed(*args, **kwargs)
+
+    def mark_question_answers_consumed(self, entries: list[dict[str, str]]) -> bool:
+        return self._store.mark_question_answers_consumed(entries)
 
     def resolve_session(self, session_id: str, resolution: str = "session deleted") -> int:
         return self._store.resolve_session(session_id, resolution)
