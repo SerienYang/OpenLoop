@@ -119,11 +119,7 @@ MATRIX: dict[str, ModelEntry] = {
     ),
     "zai:glm-5.2": ModelEntry("GLM-5.2 · Z AI", _AGENTIC, 128_000),
     "deepseek:deepseek-v4-flash": ModelEntry(
-        "DeepSeek V4 Flash · DeepSeek",
-        ModelCapabilities(
-            tools=True, vision=True, parallel_tool_calls=True, streaming=True
-        ),
-        128_000,
+        "DeepSeek V4 Flash · DeepSeek", _AGENTIC, 128_000
     ),
     "deepseek:deepseek-v4-pro": ModelEntry(
         "DeepSeek V4 Pro · DeepSeek", _AGENTIC, 128_000

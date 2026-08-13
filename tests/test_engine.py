@@ -442,14 +442,13 @@ def test_outbound_replaces_images_for_non_vision_models(tmp_path):
     assert engine.messages[-1]["content"][1]["type"] == "image_url"  # history untouched
 
 
-def test_outbound_keeps_images_for_deepseek_flash(tmp_path):
+def test_outbound_rechecks_image_support_after_each_model_switch(tmp_path):
     class MatrixProvider(ScriptedProvider):
         def capabilities(self, model):
             return capabilities_for(model)
 
     engine, _ = _engine(tmp_path, [_text_turn("ok")])
     engine.provider = MatrixProvider([_text_turn("ok")])
-    engine.model = "deepseek:deepseek-v4-flash"
     engine.messages.append(
         {
             "role": "user",
@@ -463,5 +462,21 @@ def test_outbound_keeps_images_for_deepseek_flash(tmp_path):
         }
     )
 
+    engine.model = "deepseek:deepseek-v4-flash"
+    parts = engine._outbound_messages()[-1]["content"]
+    assert parts[-1]["type"] == "text"
+    assert "not viewable" in parts[-1]["text"]
+
+    engine.switch_model("opencode-go:gpt-5.6-luna")
     parts = engine._outbound_messages()[-1]["content"]
     assert parts[-1]["type"] == "image_url"
+
+    engine.switch_model("opencode-go:mimo-v2.5-pro")
+    parts = engine._outbound_messages()[-1]["content"]
+    assert parts[-1]["type"] == "text"
+    assert "not viewable" in parts[-1]["text"]
+
+    original = next(
+        message for message in engine.messages if message.get("role") == "user"
+    )
+    assert original["content"][-1]["type"] == "image_url"

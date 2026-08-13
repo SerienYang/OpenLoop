@@ -111,6 +111,28 @@ def test_capabilities_known_models():
     assert capabilities_for("deepseek-chat").tools is True
 
 
+def test_opencode_go_resolves_vision_per_model_family():
+    assert capabilities_for("deepseek:deepseek-v4-flash").vision is False
+    for model in (
+        "gpt-5.6-luna",
+        "grok-4.5",
+        "kimi-k3",
+        "qwen3.8-max",
+        "mimo-v2.5",
+    ):
+        caps = capabilities_for(f"opencode-go:{model}")
+        assert caps.vision is True, model
+        assert caps.pdf is False, model
+    for model in (
+        "deepseek-v4-flash",
+        "glm-5.2",
+        "minimax-m3",
+        "mimo-v2.5-pro",
+        "hy3",
+    ):
+        assert capabilities_for(f"opencode-go:{model}").vision is False, model
+
+
 def test_capabilities_via_provider():
     provider = OpenAIProvider(client=_FakeClient(_response()))
     caps = provider.capabilities("gpt-5.5")
