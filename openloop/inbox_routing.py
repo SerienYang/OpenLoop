@@ -112,16 +112,20 @@ def resolve_from_reply(
 ) -> Optional[bool]:
     """Correlate an inbound channel reply to its item (by the embedded id) and resolve it.
 
-    Looks for the ``[ol:<id>]`` token and an allow/deny intent; falls back to treating the whole
-    message as a free-text answer. ``resolve(item_id, resolution)`` is the InboxStore.resolve.
-    Returns the resolve() result, or None if no item id was found."""
+    Question replies preserve the whole answer after removing the ``[ol:<id>]`` token. Approval
+    replies fail closed because authorization must come from a structured action. Directory and
+    plan replies retain their existing resolution parsing. Returns the resolve() result, or None
+    if no item id was found."""
     m = _ID_TOKEN.search(reply or "")
     if not m:
         return None
     item_id = m.group(1)
     answer = _ID_TOKEN.sub("", reply).strip()
-    if kind_for is not None and kind_for(item_id) == "question":
+    kind = kind_for(item_id) if kind_for is not None else ""
+    if kind == "question":
         return resolve(item_id, answer)
+    if kind not in {"directory", "plan"}:
+        return False
     lowered = reply.lower()
     if _ALLOW_WORDS.search(lowered) or "👍" in reply or "✅" in reply:
         resolution = "allow"

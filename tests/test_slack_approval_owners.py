@@ -251,7 +251,7 @@ def test_rejected_click_uses_only_slacks_ephemeral_response_url(monkeypatch):
     assert "approval owner" in calls[0][1]["json"]["text"]
 
 
-def test_slack_reply_token_is_owner_only_for_approvals(tmp_path):
+def test_slack_reply_token_cannot_resolve_approvals_for_any_actor(tmp_path):
     manager = _manager(tmp_path)
     _manual_profile(
         manager,
@@ -272,7 +272,8 @@ def test_slack_reply_token_is_owner_only_for_approvals(tmp_path):
         source=SessionSource("slack", "C1", user_id="U_OWNER"),
     )
     assert manager._resolve_inbox_reply(owner) is True
-    assert manager.inbox.get(item.id).resolution == "allow"
+    assert manager.inbox.get(item.id).state == "pending"
+    assert manager.inbox.get(item.id).resolution is None
 
 
 def test_ownerless_binding_does_not_mirror(tmp_path):
