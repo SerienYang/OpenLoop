@@ -35,6 +35,10 @@ const PERMISSION_OPTIONS: Option[] = [
 
 // Drop the provider prefix for display (anthropic:claude-opus-4-8 → claude-opus-4-8); full id on hover.
 const shortModel = (m: string) => (m.includes(":") ? m.split(":").slice(1).join(":") : m);
+const newRequestId = () =>
+  (crypto as any).randomUUID
+    ? (crypto as any).randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
 // Identify an attachment by name + payload size so duplicates (e.g. the same file picked twice,
 // or a prefill applied twice) collapse to one chip.
@@ -46,6 +50,8 @@ const mergeAttachments = (cur: Attachment[], add: Attachment[]): Attachment[] =>
   const seen = new Set(cur.map(attKey));
   return [...cur, ...add.filter((a) => !seen.has(attKey(a)))].slice(0, 8);
 };
+const answerPayloadKey = (itemId: string, text: string, attachments: Attachment[]) =>
+  JSON.stringify({ itemId, text, attachments });
 
 interface Props {
   placement?: "dock" | "launch";
@@ -103,6 +109,15 @@ interface Props {
   contextWindow?: number;
   // Settings toggle (default off): true shows the fill bar instead of the session total.
   contextBar?: boolean;
+  questionAnswer?: {
+    itemId: string;
+    sessionId: string;
+    onSubmit: (
+      responseId: string,
+      text: string,
+      attachments: Attachment[],
+    ) => Promise<{ status: string; error?: string }>;
+  };
 }
 
 export function Composer(props: Props) {
@@ -124,7 +139,11 @@ export function Composer(props: Props) {
     if (pendingSkill && !prefixIntact) setPendingSkill(null);
   }, [pendingSkill, prefixIntact]);
   const slashQuery =
-    !prefixIntact && props.sessionId && text.startsWith("/") && !/\s/.test(text.slice(1))
+    !props.questionAnswer &&
+    !prefixIntact &&
+    props.sessionId &&
+    text.startsWith("/") &&
+    !/\s/.test(text.slice(1))
       ? text.slice(1).toLowerCase()
       : null;
   const slashMatches = (slashSkills ?? []).filter((s) =>
@@ -156,6 +175,33 @@ export function Composer(props: Props) {
   const [dictationError, setDictationError] = useState<string | null>(null);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [attachNotice, setAttachNotice] = useState<string | null>(null);
+  const [answerSubmitting, setAnswerSubmitting] = useState(false);
+  const answerRequestRef = useRef<{ key: string; responseId: string } | null>(null);
+  const previousQuestionIdRef = useRef("");
+  const answerStateRef = useRef<{
+    itemId: string;
+    resetKey: string;
+    text: string;
+    attachments: Attachment[];
+  }>({ itemId: "", resetKey: "", text: "", attachments: [] });
+  answerStateRef.current = {
+    itemId: props.questionAnswer?.itemId ?? "",
+    resetKey: props.resetKey ?? "",
+    text,
+    attachments,
+  };
+  useEffect(() => {
+    const nextId = props.questionAnswer?.itemId ?? "";
+    const previousId = previousQuestionIdRef.current;
+    previousQuestionIdRef.current = nextId;
+    if (previousId && previousId !== nextId) {
+      setText("");
+      setAttachments([]);
+      setPendingSkill(null);
+      setAnswerSubmitting(false);
+      answerRequestRef.current = null;
+    }
+  }, [props.questionAnswer?.itemId]);
   const fileInput = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const noticeTimer = useRef<number | null>(null);
@@ -185,6 +231,8 @@ export function Composer(props: Props) {
     setText("");
     setAttachments([]);
     setPendingSkill(null);
+    setAnswerSubmitting(false);
+    answerRequestRef.current = null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.resetKey]);
 
@@ -330,26 +378,71 @@ export function Composer(props: Props) {
 
   const needsModel = props.modelReady === false;
 
-  const submit = () => {
+  const submit = async () => {
     // While the "/" popup is open the draft is a query, not a message — never send it.
     if (slashQuery !== null) return;
     // The visible "/name " prefix is UI state, not message text — strip it for the send;
     // the skill rides as its own field.
     const skill = prefixIntact ? pendingSkill!.name : undefined;
-    const t = (skill ? text.slice(skill.length + 1) : text).trim();
+    const textValue = (skill ? text.slice(skill.length + 1) : text).trim();
     if (
-      (!t && attachments.length === 0 && !skill) ||
-      props.running ||
+      (!textValue && attachments.length === 0 && !skill) ||
       dictation?.recording ||
       dictationBusy
     )
       return;
+    if (props.questionAnswer) {
+      if (answerSubmitting) return;
+      const key = answerPayloadKey(
+        props.questionAnswer.itemId,
+        textValue,
+        attachments,
+      );
+      if (answerRequestRef.current?.key !== key) {
+        answerRequestRef.current = { key, responseId: newRequestId() };
+      }
+      const requestResetKey = props.resetKey ?? "";
+      setAnswerSubmitting(true);
+      try {
+        const result = await props.questionAnswer.onSubmit(
+          answerRequestRef.current.responseId,
+          textValue,
+          attachments,
+        );
+        const current = answerStateRef.current;
+        const currentKey = answerPayloadKey(
+          current.itemId,
+          current.text.trim(),
+          current.attachments,
+        );
+        if (
+          (result.status === "accepted" || result.status === "accepted_replay") &&
+          current.resetKey === requestResetKey &&
+          (currentKey === key || current.itemId === "")
+        ) {
+          setText("");
+          setAttachments([]);
+          setPendingSkill(null);
+          answerRequestRef.current = null;
+        } else if (result.error) {
+          showAttachNotice(result.error);
+        }
+      } catch (error) {
+        showAttachNotice(
+          error instanceof Error ? error.message : t("Could not send the answer."),
+        );
+      } finally {
+        setAnswerSubmitting(false);
+      }
+      return;
+    }
+    if (props.running) return;
     // No model connected: keep the draft (don't drop it) and send the user to setup instead.
     if (needsModel) {
       props.onConnectModel?.();
       return;
     }
-    props.onSend(t, attachments, skill);
+    props.onSend(textValue, attachments, skill);
     setText("");
     setAttachments([]);
     setPendingSkill(null);
@@ -382,7 +475,7 @@ export function Composer(props: Props) {
     }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      submit();
+      void submit();
     }
   };
 
@@ -563,7 +656,11 @@ export function Composer(props: Props) {
             "w-full block px-3.5 pb-1.5 text-[14.5px] " +
             (props.sessionId && props.projects && props.onProjectsChanged && !props.sessionMessages ? "pt-1" : "pt-3.5")
           }
-          placeholder={t(props.placeholder || "Ask OpenLoop…  (drop or paste files)")}
+          placeholder={t(
+            props.questionAnswer
+              ? "Answer the current question…"
+              : props.placeholder || "Ask OpenLoop…  (drop or paste files)",
+          )}
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKey}
@@ -701,8 +798,22 @@ export function Composer(props: Props) {
           )}
 
           {/* send / stop */}
-          {props.running ? (
-            <button className="btn danger" onClick={props.onInterrupt}>
+          {props.questionAnswer ? (
+            <>
+              <button
+                className="btn approval-primary"
+                onClick={() => void submit()}
+                disabled={!hasContent || answerSubmitting}
+                aria-label={t("Answer")}
+              >
+                {answerSubmitting ? t("Sending…") : t("Answer")}
+              </button>
+              <button className="btn danger" onClick={props.onInterrupt} aria-label={t("Stop")}>
+                ⏹ {t("Stop")}
+              </button>
+            </>
+          ) : props.running ? (
+            <button className="btn danger" onClick={props.onInterrupt} aria-label={t("Stop")}>
               ⏹ {t("Stop")}
             </button>
           ) : (
@@ -713,7 +824,7 @@ export function Composer(props: Props) {
                   ? "bg-accent text-onAccent hover:brightness-105"
                   : "bg-paper border border-line text-faint")
               }
-              onClick={submit}
+              onClick={() => void submit()}
               disabled={!props.connected || !!dictation?.recording || !!dictationBusy}
               title={needsModel ? t("Connect a model to send") : undefined}
               aria-label={t("Send")}

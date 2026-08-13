@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useRef, useState, type ReactNode } from "react";
 import { imeComposing } from "../ime";
 import type { InboxItem } from "../api";
 import { humanizeApprovalTitle } from "../humanize";
@@ -32,6 +32,9 @@ const OPT_OFF = "border-line bg-paper text-ink hover:border-accent hover:bg-acce
 const OPT_ON = "border-accent bg-accentSoft text-accent font-medium";
 const INPUT =
   "flex-1 min-w-0 rounded-lg bg-paper border border-line px-3 py-2 text-[13px] text-ink placeholder:text-faint outline-none focus:border-lineStrong";
+const newResponseId = () =>
+  (crypto as any).randomUUID?.() ??
+  `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
 export function InboxItemCard({
   item,
@@ -40,13 +43,23 @@ export function InboxItemCard({
   compact,
 }: {
   item: InboxItem;
-  onResolve: (id: string, resolution: string) => void;
+  onResolve: (
+    id: string,
+    resolution: string,
+    responseId?: string,
+  ) =>
+    | void
+    | Promise<void | { status?: string; error?: string }>;
   chip?: ReactNode; // optional "go to session" affordance (shown in the Inbox list, not inline)
   compact?: boolean;
 }) {
   const { t } = useI18n();
   const [answer, setAnswer] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
+  const [showOther, setShowOther] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [questionError, setQuestionError] = useState("");
+  const questionResponseRef = useRef<{ key: string; id: string } | null>(null);
   const options = (() => {
     const seen = new Set<string>();
     const candidates = Array.isArray(item.options) ? item.options : [];
@@ -74,7 +87,37 @@ export function InboxItemCard({
     return normalized;
   })();
   const multi = !!item.multi;
-  const allowText = item.allow_text !== false;
+  const submitQuestion = async (resolution: string) => {
+    const answer = resolution.trim();
+    if (!answer || submitting) return;
+    const key = `${item.id}\u0000${answer}`;
+    if (questionResponseRef.current?.key !== key) {
+      questionResponseRef.current = { key, id: newResponseId() };
+    }
+    setSubmitting(true);
+    setQuestionError("");
+    try {
+      const result = await onResolve(
+        item.id,
+        answer,
+        questionResponseRef.current.id,
+      );
+      if (
+        result &&
+        typeof result === "object" &&
+        result.status &&
+        !["accepted", "accepted_replay", "already_resolved"].includes(result.status)
+      ) {
+        setQuestionError(result.error || t("Could not send the answer."));
+      }
+    } catch (error) {
+      setQuestionError(
+        error instanceof Error ? error.message : t("Could not send the answer."),
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   const textRow = (placeholder: string) => (
     <div className="flex items-center gap-2 mt-2.5">
@@ -84,11 +127,17 @@ export function InboxItemCard({
         value={answer}
         onChange={(e) => setAnswer(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Enter" && !imeComposing(e) && answer.trim()) onResolve(item.id, answer);
+          if (e.key === "Enter" && !imeComposing(e) && answer.trim()) {
+            void submitQuestion(answer);
+          }
         }}
       />
-      <button className={BTN_PRIMARY} disabled={!answer.trim()} onClick={() => onResolve(item.id, answer)}>
-        {t("Send")}
+      <button
+        className={BTN_PRIMARY}
+        disabled={!answer.trim() || submitting}
+        onClick={() => void submitQuestion(answer)}
+      >
+        {submitting ? t("Sending…") : t("Send")}
       </button>
     </div>
   );
@@ -175,7 +224,7 @@ export function InboxItemCard({
                         setSelected((s) =>
                           on ? s.filter((x) => x !== opt.value) : [...s, opt.value],
                         );
-                      else onResolve(item.id, opt.value); // single-select resolves immediately
+                      else void submitQuestion(opt.value); // single-select resolves immediately
                     }}
                   >
                     {multi && on && <span className="text-accent text-[11px] leading-none">✓</span>}
@@ -183,6 +232,12 @@ export function InboxItemCard({
                   </button>
                 );
               })}
+              <button
+                className={OPT_BASE + " " + OPT_OFF}
+                onClick={() => setShowOther(true)}
+              >
+                {t("Other")}
+              </button>
             </div>
           )}
           {multi && options.length > 0 && (
@@ -190,14 +245,19 @@ export function InboxItemCard({
               <button
                 className={BTN_PRIMARY}
                 disabled={!selected.length}
-                onClick={() => onResolve(item.id, selected.join(", "))}
+                onClick={() => void submitQuestion(selected.join(", "))}
               >
                 {t("Send")}{selected.length ? ` (${selected.length})` : ""}
               </button>
             </div>
           )}
-          {(allowText || options.length === 0) &&
+          {(showOther || options.length === 0) &&
             textRow(options.length ? t("Or type your own answer…") : t("Your answer…"))}
+          {questionError && (
+            <div className="mt-2 text-[12px] text-danger" role="alert">
+              {questionError}
+            </div>
+          )}
         </>
       ) : item.kind === "directory" ? (
         <div className="flex items-center gap-2 mt-2.5">

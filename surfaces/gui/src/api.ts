@@ -1,4 +1,4 @@
-import type { SessionInfo, WsEvent } from "./types";
+import type { Attachment, SessionInfo, WsEvent } from "./types";
 
 declare const __OPENLOOP_DEV_TOKEN__: string;
 
@@ -973,6 +973,45 @@ export async function resolveInboxItem(
   return res.json();
 }
 
+export type QuestionResolutionStatus =
+  | "accepted"
+  | "accepted_replay"
+  | "response_conflict"
+  | "already_resolved"
+  | "rejected";
+
+export interface QuestionResolutionResult {
+  status: QuestionResolutionStatus;
+  item_id: string;
+  response_id: string;
+  error?: string;
+}
+
+export async function resolveQuestionItem(
+  id: string,
+  request: {
+    session_id: string;
+    response_id: string;
+    answer: string;
+    attachments?: Attachment[];
+  },
+): Promise<QuestionResolutionResult> {
+  const res = await fetch(`${httpBase()}/v1/pending/${encodeURIComponent(id)}/resolve-question`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  const body = await res.json();
+  if (res.ok) return body;
+  const detail = body?.detail;
+  return {
+    status: detail?.status || "rejected",
+    item_id: id,
+    response_id: request.response_id,
+    error: detail?.error || body?.error || `Request failed (${res.status})`,
+  };
+}
+
 // -- channel subscriptions (view-only) ----------------------------------------
 export interface Subscription {
   session_id: string;
@@ -1749,28 +1788,24 @@ export class Session {
     });
   }
 
-  approve(decision: string) {
-    this.send({ type: "approval", decision });
+  approve(itemId: string, decision: string) {
+    this.send({ type: "approval", item_id: itemId, decision });
   }
 
   // Reply to a `request_directory` prompt: grant a folder (with access level) or decline.
-  respondDirectory(granted: boolean, path?: string, writable?: boolean) {
-    this.send({ type: "directory_response", granted, ...(path ? { path } : {}), writable: !!writable });
+  respondDirectory(itemId: string, granted: boolean, path?: string, writable?: boolean) {
+    this.send({ type: "directory_response", item_id: itemId, granted, ...(path ? { path } : {}), writable: !!writable });
   }
 
   // Reply to a `propose_plan` prompt: approve (choosing the execution mode) or reject with feedback.
-  respondPlan(approved: boolean, mode?: string, feedback?: string) {
+  respondPlan(itemId: string, approved: boolean, mode?: string, feedback?: string) {
     this.send({
       type: "plan_response",
+      item_id: itemId,
       approved,
       ...(mode ? { mode } : {}),
       ...(feedback ? { feedback } : {}),
     });
-  }
-
-  // Answer a live `ask_user` prompt (attended sessions; unattended ones answer via the Inbox).
-  respondQuestion(answer: string) {
-    this.send({ type: "question_response", answer });
   }
 
   interrupt() {

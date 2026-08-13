@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
   getInbox,
   resolveInboxItem,
+  resolveQuestionItem,
   type InboxItem,
 } from "../api";
 import { Icon } from "./Icon";
@@ -28,9 +29,25 @@ export function InboxView({
     return () => clearInterval(t);
   }, []);
 
-  const resolve = async (id: string, resolution: string) => {
-    await resolveInboxItem(id, resolution);
+  const resolve = async (
+    id: string,
+    resolution: string,
+    responseId?: string,
+  ) => {
+    const item = items.find((candidate) => candidate.id === id);
+    let result;
+    if (item?.kind === "question") {
+      result = await resolveQuestionItem(id, {
+        session_id: item.session_id,
+        response_id: responseId || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        answer: resolution,
+        attachments: [],
+      });
+    } else {
+      await resolveInboxItem(id, resolution);
+    }
     load();
+    return result;
   };
 
   // The originating-session chip links back to its OpenLoop session.
